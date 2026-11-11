@@ -239,6 +239,19 @@ Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area) {
         }
     }
     Shader::Ampere::native_matrix_multiply = dev.native_mma && !graphics && native_key;
+    {   // (super build) RX_VK_LOWER_SKIP=<key prefix,...>: those programs left unlowered, as if they did not lower (a bisection)
+        static const std::string skip = getenv("RX_VK_LOWER_SKIP") ? getenv("RX_VK_LOWER_SKIP") : "";
+        if (!skip.empty()) {
+            char hex[24];
+            snprintf(hex, sizeof hex, "%016llx", (unsigned long long)c.key);
+            for (size_t at = 0; at < skip.size();) {
+                const size_t e = skip.find(',', at);
+                const std::string t = skip.substr(at, e == std::string::npos ? std::string::npos : e - at);
+                if (!t.empty() && !strncmp(hex, t.c_str(), t.size())) return c;
+                at = e == std::string::npos ? skip.size() : e + 1;
+            }
+        }
+    }
     const auto lowered = Shader::Ampere::LowerToMaxwell(native);
     if (lowered && lowered.register_map_words) {   // (hookshot) which programs run with extended registers
         static std::atomic<int> logged{0};
@@ -1637,7 +1650,15 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             Env vs_env{s, *vsc, Shader::Stage::VertexB};
             auto vs = translate(vs_env, true);
             questions += vs_env.texture_questions;
+            std::unique_ptr<Translation> fs;
+            if (fsc) {
+                Env fs_env{s, *fsc, Shader::Stage::Fragment};
+                fs = translate(fs_env, true);
+                questions += fs_env.texture_questions;
+                oot_visual(fs->program, fsc->key);
+            }
             Shader::RuntimeInfo vrt{};
+            Shader::RuntimeInfo frt{};
             if (!vs->program.info.stores[Shader::IR::Attribute::PointSize]) vrt.fixed_state_point_size = 1.0f;
             // (an attribute the draw leaves unset: build_graphics gives it a stream of (0, 0, 0, 1). It took Disabled here, under the
             // same key)
@@ -1648,6 +1669,20 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             // load result for the grid dimensions in the coordinate clamps. The SPIR-V names the right result.
             constexpr uint64_t kDekuWebVertexCode = 0xb449bcdb69b36a8aull;
             vrt.inline_global_128_loads = dev.props.vendorID == 0x10DE && vsc->key == kDekuWebVertexCode;
+            // (OoT's Royal Family Tomb water writes clip.xy/clip.w as a noperspective varying. Clipping a
+            // vertex with w close to zero then makes AMD interpolate the wrong depth, whose exp2 overflows
+            // into the red dotted line. Write it times Position.w and interpolate perspective-correct in
+            // the fragment stage, where multiplying by FragCoord.w restores the screen-linear value.)
+            // Indexed fragment reads cannot undo that multiply, transform feedback would capture the
+            // scaled value, and mesh pipelines keep their existing per-primitive interpolation.
+            if (fs && !fs->program.info.loads_indexed_attributes && vrt.xfb_count == 0) {
+                for (size_t i = 0; i < fs->program.info.interpolation.size(); ++i) {
+                    if (fs->program.info.interpolation[i] == Shader::Interpolation::NoPerspective) {
+                        vrt.noperspective_outputs.set(i);
+                    }
+                }
+                frt.scaled_noperspective_inputs = vrt.noperspective_outputs.any();
+            }
             Stage v;
             v.nvn_stage = 0;
             const std::vector<uint32_t> vspirv = Shader::Backend::SPIRV::EmitSPIRV(profile_graphics(VK_SHADER_STAGE_VERTEX_BIT), vrt, vs->program, bindings);
@@ -1667,12 +1702,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             v.vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
             v.c1 = vsc->c1;
             p.stages.push_back(std::move(v));
-            if (fsc) {
-                Env fs_env{s, *fsc, Shader::Stage::Fragment};
-                auto fs = translate(fs_env, true);
-                questions += fs_env.texture_questions;
-                oot_visual(fs->program, fsc->key);
-                Shader::RuntimeInfo frt{};
+            if (fs) {
                 frt.previous_stage_stores = vs->program.info.stores;
                 for (int i = 0; i < 8; i++) frt.color_output_types[i] = static_cast<Shader::AttributeType>(color_types[i]);
                 static const bool nan_guard = !getenv("RX_VK_NAN_GUARD") || atoi(getenv("RX_VK_NAN_GUARD")) != 0;
