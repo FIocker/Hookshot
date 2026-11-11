@@ -39,6 +39,12 @@ struct Offset { int x = 0, y = 0, z = 0; };
 struct Layers { int aspect = 0, level = 0, first = 0, count = 0; };
 struct VkImageBlit { Layers srcSubresource, dstSubresource; Offset srcOffsets[2], dstOffsets[2]; };
 struct { int upscale = 0, sharpness = 0, framegen = 0; } opts;
+// (hookshot) The window filter as the inline in vk_menu.h gives it (0-2; a value past the row is Off), so the spy mirrors
+// that rather than reading opts.upscale raw
+int window_filter() {
+    return opts.upscale >= 0 && opts.upscale <= 2 ? opts.upscale : 0;
+}
+bool temporal_upscale_recent() { return false; }   // (no temporal upscaler here: window_sharpness gives the row as it is)
 struct SpyMutex {
     bool held = false;
     void lock() { CHECK(!held); held = true; }

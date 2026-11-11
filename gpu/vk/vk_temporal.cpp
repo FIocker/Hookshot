@@ -55,6 +55,7 @@
 #include "temporal_jitter.h"
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
+#include "vk_dlssnr_ngx.h"   // (super build: neural rendering before the upscaler or before the HUD, nr::apply)
 #include "vk_draw.h"
 #include "vk_fsr3.h"   // (fsr3_wanted: AMD FSR 3.1 upscales with inputs of its own)
 #include "vk_fsr4.h"
@@ -107,6 +108,36 @@ bool temporal_wanted() { return temporal_mode() != ur::GAME; }
 bool temporal_off() { return opts.dlss == ur::OFF && temporal_mode() == ur::GAME; }
 bool temporal_full_scale() { return ur::full_scale(temporal_mode()); }
 
+// (super build) The frame (texture_frame_no) neural rendering last ran on the engine's picture or the scene, before the HUD:
+// the present's own pass is left out while it does
+std::atomic<uint64_t> nr_before_hud_at{0};
+// (super build) The frame a temporal upscaler (DLSS, DLAA, FSR 4, FSR 3.1) last drew the scene's upscale: the window's
+// sharpening is lighter then (vk_framegen.cpp window_sharpness)
+std::atomic<uint64_t> temporal_upscale_at{0};
+void note_temporal_upscale() { temporal_upscale_at.store(texture_frame_no(), std::memory_order_relaxed); }
+bool temporal_upscale_recent() {
+    const uint64_t at = temporal_upscale_at.load(std::memory_order_relaxed);
+    return at && texture_frame_no() - at <= 2;
+}
+namespace {
+// (super build) Whether neural rendering is asked to run before the upscaler (the Neural tab's Stage row, opts.nr_stage;
+// RX_VK_DLSS_NR_STAGE=before over it), with a backend that runs there (NGX direct, Open)
+bool nr_pre_upscale_asked() {
+    static const char* env = getenv("RX_VK_DLSS_NR_STAGE");
+    const bool before = env && *env ? !strcmp(env, "before") : opts.nr_stage == 1;
+    if (!before) return false;
+    const int b = nr::running_backend();
+    return b == nr::NGX || b == nr::OPEN;
+}
+}  // namespace
+bool dlss_nr_before_hud() {
+    const uint64_t at = nr_before_hud_at.load(std::memory_order_relaxed);
+    // (before the upscaler, the present's own pass stays out for a while after the last frame the model ran there, not
+    // two frames: a pause menu or a cut without the engine's upscale would otherwise make the model's feature again at the
+    // window's size, and again at the render size after, a hitch each way)
+    return at && texture_frame_no() - at <= (nr_pre_upscale_asked() ? 600u : 2u);
+}
+
 namespace {
 
 struct Image {
@@ -120,6 +151,8 @@ struct Image {
 
 struct Camera {
     float current[16]{};      // (its view-projection)
+    float view[12]{};         // (super build: the view, rows 0-2 of the block: right, up, back, each with its translation)
+    float proj[16]{};         // (super build: the projection, rows 7-10 at 0x70, jittered as drawn)
     float jitter[2]{};        // (the projection's offset of the picture's centre, in clip space: nx2/oot_jitter.py)
     float near_z = 0, far_z = 0, fov_y = 0;   // (its projection's, 0 when it is not a plain perspective one)
     uint32_t width = 0, height = 0;
@@ -157,6 +190,7 @@ struct State {
     uint64_t depth_views_gen = 0;
     const char* reason = nullptr;
     int reason_repeats = 0;
+    bool told_nr_pre = false;   // (super build: neural rendering before the upscaler, logged once)
     const TemporalEngine* told_first = nullptr;
     bool told_camera = false;
     // (actor motion: the skinned draws into the scene since the last upscale; the poses the engine last drew, by draw: the
@@ -585,8 +619,9 @@ uint32_t bones_used(const SkinnedDraw& k) {
     for (int64_t i = 0; i < n; i++) {
         const uint8_t* q = v.data() + (size_t)i * k.stride;
         for (int set = 0; set < k.sets; set++)
-            for (int j = 0; j < 4; j++) {
-                if (!q[k.weights[set] + j]) continue;
+            for (int j = 0; j < ((k.formats & (dlss_actor::kSingle << set)) ? 1 : (k.formats & (dlss_actor::kPair << set)) ? 2 : 4);
+                 j++) {   // (super build: one in a single set, two in a pair; a set without weights weighs 1)
+                if (!(k.formats & (dlss_actor::kNoWeight << set)) && !q[k.weights[set] + j]) continue;
                 uint32_t joint = 0;
                 if (k.formats & (dlss_actor::kByteJoints << set)) joint = q[k.joints[set] + j];
                 else std::memcpy(&joint, q + k.joints[set] + 2 * j, 2);
@@ -647,6 +682,8 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
         return;
     Camera& k = s.cam;
     std::memcpy(k.current, c + 0x30 / 4, sizeof k.current);
+    std::memcpy(k.view, c, sizeof k.view);
+    std::memcpy(k.proj, c + 0x70 / 4, sizeof k.proj);
     // (the offset sead's projection gave the frustum, in its third column: 2 * offset, which moves the picture by -that)
     k.jitter[0] = -c[0x78 / 4], k.jitter[1] = -c[0x88 / 4];
     // (its planes and field of view, for an engine that wants them (FSR's depth heuristics): an OpenGL-style projection, depth
@@ -820,6 +857,8 @@ bool stretch(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImage
 }
 }  // namespace
 
+
+
 bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImageView in_view, Texture* out,
                       VkImageView out_view, uint32_t out_level) {
     const int mode = temporal_mode();
@@ -903,10 +942,11 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     }
     if (ready == 0) return fail(why ? why : "not this frame");
     if (ready == 2) s.engines_made++, s.last_frame = 0;   // (made just now: a new history)
-    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih) ||
+    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih,
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||   // (neural rendering before the upscaler)
         !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, iw, ih) ||
         !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, iw, ih, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
-        !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh))
+        !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh, VK_IMAGE_USAGE_TRANSFER_SRC_BIT))   // (read by neural rendering's blit)
         return fail("its images were not made");
 
     const uint64_t now = texture_frame_no();
@@ -958,6 +998,40 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         prep();
         full_barrier(cmd);
     }
+    // (super build) Neural rendering before the upscaler (the Neural tab's Stage row, opts.nr_stage; RX_VK_DLSS_NR_STAGE=before
+    // over it): the model goes over the scene at its render size, which the engine then takes up to the window's. The model's
+    // cost goes with its pixels: at Quality's 67% that is under half of them, at Performance's 50% a quarter (measured on an
+    // RTX card at 4168x1976, DLSS Quality: 47 fps against 37 after the upscaler). The colour here is the same square-root
+    // display-like encoding as the engine's picture after (dlss_prep.comp), so the model sees what it sees there. Its result
+    // goes back into the engine's colour input; depth and motion are left as they are. NGX direct and Open only (Streamline's
+    // NR keys its frames to the present). The model gets the scene's own depth, motion and jitter, and the chain's resets
+    // (NrFrame): told there was none, a model that keeps history would average away the jitter the engine needs and ghost on
+    // camera motion
+    bool nr_pre = false;
+    if (nr_pre_upscale_asked()) {
+        NrFrame scene;
+        scene.depth = s.depth.image, scene.depth_view = s.depth.view;
+        scene.motion = s.motion.image, scene.motion_view = s.motion.view;
+        dlss_math::jitter_to_pixels(cam.jitter, rw, rh, scene.jitter);
+        scene.reset = reset;
+        full_barrier(cmd);   // (the depth and motion just made, read by the model)
+        VkImageView nr_view = VK_NULL_HANDLE;
+        const VkImage nr_image = nr::apply(cmd, s.color.image, rw, rh, &nr_view, &scene);
+        if (nr_image) {
+            VkImageBlit bl{};
+            bl.srcSubresource = bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            bl.srcOffsets[1] = bl.dstOffsets[1] = {(int32_t)rw, (int32_t)rh, 1};
+            vkCmdBlitImage(cmd, nr_image, VK_IMAGE_LAYOUT_GENERAL, s.color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+                           VK_FILTER_NEAREST);   // (through vk_work.h: counted as work there)
+            full_barrier(cmd);
+            nr_pre = true;
+            nr_before_hud_at.store(texture_frame_no(), std::memory_order_relaxed);
+            if (!s.told_nr_pre) {
+                s.told_nr_pre = true;
+                logf("vk: DLSS 5 neural rendering runs before the upscaler, on the %ux%u scene", rw, rh);
+            }
+        }
+    }
     TemporalFrame f;
     f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
     f.render_w = rw, f.render_h = rh;
@@ -976,9 +1050,26 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         return false;   // (the network writes its output over whatever the evaluation did)
     }
     full_barrier(cmd);
+    // (super build) DLSS 5 neural rendering here, on the engine's picture before the game draws its HUD over it, rather than at
+    // the present over the finished frame: the model then never sees the hearts, the map or the text (it left a dark smudge
+    // behind them). The picture is the square root of the tonemapped colour, a display-like encoding the model takes as it
+    // takes a finished frame; dlss_out.comp squares its result as it would have squared the engine's. NGX direct only
+    // (Streamline's NR keys its frames to the present). RX_VK_DLSS_NR_STAGE=present: at the present, as before
+    VkImageView picture = s.output.view;
+    if (!nr_pre) {
+        static const bool at_present = getenv("RX_VK_DLSS_NR_STAGE") && !strcmp(getenv("RX_VK_DLSS_NR_STAGE"), "present");
+        if (!at_present && nr::running_backend() == nr::NGX) {
+            VkImageView nr_view = VK_NULL_HANDLE;
+            if (nr::apply(cmd, s.output.image, dw, dh, &nr_view) && nr_view) {
+                picture = nr_view;
+                nr_before_hud_at.store(texture_frame_no(), std::memory_order_relaxed);
+                full_barrier(cmd);
+            }
+        }
+    }
     {
         const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
-        const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},
+        const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, picture, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
         VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
         w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -995,6 +1086,7 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     // (for the status line, temporal_status: the jitter the engine was given, in render pixels)
     s.status_jitter[0] = f.jitter[0], s.status_jitter[1] = f.jitter[1], s.status_motion = motion;
     s.status_drawn++;
+    note_temporal_upscale();
 
     std::memcpy(s.last_vp, cam.current, sizeof s.last_vp);
     s.jitter.publish(rw, rh, (uint32_t)dlss_jitter_phases(rw, rh, dw, dh), now);

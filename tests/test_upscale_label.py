@@ -41,8 +41,12 @@ int main() {
     CHECK(std::strcmp(tx_upscale(0), "Off") == 0);
     CHECK(std::strcmp(tx_upscale(1), "Catmull-Rom") == 0);
     CHECK(std::strcmp(tx_upscale(2), "Lanczos") == 0);
-    CHECK(std::strcmp(tx_upscale(-1), "Off") == 0);
+    /* 3 and 4 were the fork's scene upscalers on this row: they are the Upscaler row's now, and read as Off here */
     CHECK(std::strcmp(tx_upscale(3), "Off") == 0);
+    CHECK(std::strcmp(tx_upscale(4), "Off") == 0);
+    /* a value past the row still answers with the label and not the next bytes of memory */
+    CHECK(std::strcmp(tx_upscale(-1), "Off") == 0);
+    CHECK(std::strcmp(tx_upscale(5), "Off") == 0);
     CHECK(std::strcmp(tx_upscale(99), "Off") == 0);
     std::printf("PASS: upscale labels for 0..2 and for a setting past the row\n");
 }

@@ -19,6 +19,7 @@
 #include "vk_fsr3.h"
 #include "vk_fsr3_inputs.h"
 #include "vk_draw.h"      // (descriptors_disturbed)
+#include "vk_ffx.h"       // (hookshot fork: AMD FSR 4 in the same place, from the same inputs)
 #include "vk_gprof.h"     // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
 #include "vk_menu.h"
 #include "vk_temporal.h"   // (temporal_env_chosen: RX_VK_DLSS / RX_VK_FSR4 over the row's FSR 3.1)
@@ -757,7 +758,10 @@ bool fsr3_wanted() {
 bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImageView in_view, Texture* out,
                   VkImageView out_view, uint32_t out_level) {
     const bool upscaling = fsr3_wanted();
-    if (!upscaling && !fsr3_inputs::wanted()) return false;
+    // (hookshot fork) AMD FSR 4 through AMD's runtime (vk_ffx.h), the Upscaler row's value after FSR 3.1: the same inputs,
+    // its picture squared back by the same pass
+    const bool fsr4 = !upscaling && fsr4_wanted();
+    if (!upscaling && !fsr4 && !fsr3_inputs::wanted()) return false;
     if (!in || !in_view || !out || !out_view) return false;
     // (another network of the upscale's shape, as temporal_upscale takes them: only the scene into the picture. The gameplay
     // networks sample the scene's B10G11R11 colour and write the B10G11R11 picture)
@@ -765,8 +769,8 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
                    (out->width >> out_level) <= in->width || !fsr3_inputs::is_scene(in)))
         return false;
     fsr3_inputs::Frame f;
-    if (!fsr3_inputs::prepare(cmd, in, in_view, f)) return upscaling ? fail("its inputs could not be made") : false;
-    if (!upscaling) return false;   // (frame interpolation's inputs alone: the network or DLSS upscales)
+    if (!fsr3_inputs::prepare(cmd, in, in_view, f)) return upscaling || fsr4 ? fail("its inputs could not be made") : false;
+    if (!upscaling && !fsr4) return false;   // (frame interpolation's inputs alone: the network or DLSS upscales)
     Out& o = out_state();
     std::lock_guard lk(o.mu);
     const uint32_t ow = std::max(1u, out->width >> out_level), oh = std::max(1u, out->height >> out_level);
@@ -784,10 +788,27 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     ai.camera = f.camera;
     ai.frame_time_ms = f.frame_ms;
     ai.reset = f.reset;
-    if (!fsr3::upscale(cmd, ai)) return fail("its passes could not be recorded");
+    VkImageView picture = VK_NULL_HANDLE;
+    if (fsr4) {   // (hookshot fork: the same inputs as whole images, AMD's runtime's flags matching them: vk_ffx.cpp)
+        ffx::UpscaleInputs xi;
+        xi.color = f.color_image, xi.color_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        xi.depth = f.depth_image, xi.depth_format = VK_FORMAT_R32_SFLOAT;
+        xi.motion = f.motion_image, xi.motion_format = VK_FORMAT_R16G16_SFLOAT;
+        xi.render_width = f.width, xi.render_height = f.height;
+        xi.upscale_width = ow, xi.upscale_height = oh;
+        xi.jitter[0] = f.jitter[0], xi.jitter[1] = f.jitter[1];
+        xi.near_plane = f.camera.near_plane, xi.far_plane = f.camera.far_plane, xi.fov_y = f.camera.fov_y;
+        xi.frame_time_ms = f.frame_ms;
+        xi.reset = f.reset;
+        if (!ffx::upscale(cmd, xi) || !ffx::output_view()) return fail("AMD's FSR 4 runtime did not upscale");
+        picture = ffx::output_view();
+    } else {
+        if (!fsr3::upscale(cmd, ai)) return fail("its passes could not be recorded");
+        picture = fsr3::output_view();
+    }
     {
         const int32_t pc[2] = {(int32_t)ow, (int32_t)oh};
-        const VkDescriptorImageInfo info[2] = {{o.point, fsr3::output_view(), VK_IMAGE_LAYOUT_GENERAL},
+        const VkDescriptorImageInfo info[2] = {{o.point, picture, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
         VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
         w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -800,6 +821,7 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
     }
     full_barrier(cmd);
+    note_temporal_upscale();   // (super build: the window's sharpening lighter over it, vk_framegen.cpp window_sharpness)
     fsr3_inputs::upscaled(f.width, f.height, ow, oh);
     // (every 600 frames: that it still draws, and the jitter it was given, which says the host's jitter is on)
     if (++o.drawn % 600 == 0)
@@ -809,9 +831,10 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     o.reason = nullptr;
     if (!o.told_first) {
         o.told_first = true;
-        logf("vk: fsr3 %ux%u -> %ux%u with assembled depth and camera motion (network %016llx; jitter %+.3f %+.3f px, "
+        logf("vk: %s %ux%u -> %ux%u with assembled depth and camera motion (network %016llx; jitter %+.3f %+.3f px, "
              "%u phases)",
-             f.width, f.height, ow, oh, (unsigned long long)key, f.jitter[0], f.jitter[1], ai.jitter_phases);
+             fsr4 ? "amd fsr 4" : "fsr3", f.width, f.height, ow, oh, (unsigned long long)key, f.jitter[0], f.jitter[1],
+             ai.jitter_phases);
     }
     return true;
 }

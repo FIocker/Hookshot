@@ -2,7 +2,6 @@
 #include "../gpu/vk/fsr3_math.h"
 #include "../gpu/vk/dlss_math.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
