@@ -1,0 +1,8 @@
+#version 460
+// (hookshot) The khr route runs upstream's unfused graph (nr::Graph::Options::fusedBlocks off, gpu/vk/opennr/opennr_net.cpp),
+// which never dispatches the four fused kernels (fused_block32, qkv_attention, gemm_mlp, global_attention). nr::Kernels
+// still loads a module of every name, so each of them is this: a valid module that needs nothing the route does not
+// already need (upstream's own use VK_NV_cooperative_matrix2). Were one ever dispatched anyway, it would write nothing,
+// and the harness's comparison against the reference route would fail at that block (scripts/opennr_harness.py).
+layout(local_size_x = 32) in;
+void main() {}

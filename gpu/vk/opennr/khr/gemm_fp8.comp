@@ -1,0 +1,187 @@
+#version 460
+// (hookshot) The khr route's FP8 GEMM: upstream's gemm_fp8.comp (third_party/opendlss-nr/shaders) on
+// VK_KHR_cooperative_matrix alone, for any GPU that lists the shapes of a khr variant (khr_mma.glsl).
+//
+// The same kernel to the host as upstream's: its push constants, bindings, specialization constants and dispatch grid,
+// so upstream's nr::Kernels::gemmFp8 drives it unchanged. The same arithmetic: D = A (E4M3, rows x K) * B (E4M3, K x N)
+// as a chain of k32 steps in K order, each rounded to half; the residual (optionally E4, optionally scaled, the scale
+// product rounded once) seeds the accumulator of the first step; partitions accumulate from zero and their sums are
+// added in half, in partition order; the epilogue is SiLU (upstream's f32 spelling, mpCubicSilu, equal to its half
+// spelling for all 65536 inputs), then the E4M3 publication (RNE, saturating, NaN -> +0, the sign of zero kept).
+//
+// What differs is only how a workgroup gets there: each k32 step stages A [BM][32] and B [BN][32] in shared memory with
+// plain loads (widened to f16 when the variant has no E4M3 matrices), then each subgroup multiplies its own tiles; the
+// residual and the result go through shared memory as halves, element by element, so no element's position inside a
+// cooperative matrix is ever assumed. DEPTH, PADV4 and KSTEP (upstream's prefetch, padding and staging width) are
+// accepted and change nothing here: they never change the arithmetic in upstream's kernel either.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "khr_e4m3.glsl"
+#include "khr_mma.glsl"
+
+layout(constant_id = 0) const uint K = 32;
+layout(constant_id = 1) const uint TILES = 4;      // 16-column tiles per workgroup row block; BN = 16 * TILES
+layout(constant_id = 2) const uint FLAGS = 0;
+layout(constant_id = 3) const uint PARTITION = 0;
+layout(constant_id = 4) const uint DEPTH = 4;      // (upstream's prefetch depth: not used)
+layout(constant_id = 5) const uint PADV4 = 1;      // (upstream's shared padding: not used)
+layout(constant_id = 7) const uint SUBGROUPS = 4;  // BM = 16 * SUBGROUPS rows; 32 * SUBGROUPS invocations
+layout(local_size_x_id = 8) in;                    // = 32 * SUBGROUPS
+layout(constant_id = 9) const uint SPLITK = 1;     // K partitions computed by separate workgroups (partials to binding 2)
+layout(constant_id = 10) const uint KSTEP = 32;    // (upstream's staging width: not used, steps are always k32)
+
+const uint F_RESIDUAL = 1u;
+const uint F_SCALE_RESIDUAL = 2u;
+const uint F_SILU = 8u;
+const uint F_QUANTIZE = 16u;
+const uint F_DUAL = 32u;
+const uint F_RESIDUAL_E4 = 64u;
+const uint F_BROADCAST_INPUT = 128u;
+
+layout(push_constant) uniform Push {
+  uint rows;
+  uint N;
+  uint Nmatrix;
+  uint weightColumnOffset;
+  uint inputStride;
+  uint inputColumnBase;
+  uint outputStride;
+  uint outputColumnOffset;
+  uint auxHalfOffset;   // per-column f16 scale vector, in half units within binding 4
+  uint batches;
+  uint columnGroups;
+  uint splitStride;     // SPLITK > 1: f16 elements per partition slice of the partial buffer
+} pc;
+
+layout(std430, binding = 0) readonly buffer InputA { uvec4 a4[]; };              // E4M3 [rows][inputStride]
+layout(std430, binding = 1) readonly buffer InputB { uvec4 b4[]; };              // E4M3 [batch][K/32][Nmatrix][32]
+layout(std430, binding = 2) writeonly buffer OutputHalf { float16_t out16[]; };
+layout(std430, binding = 3) readonly buffer ResidualHalf { float16_t residual16[]; };
+layout(std430, binding = 4) readonly buffer Aux { float16_t aux16[]; };
+layout(std430, binding = 5) writeonly buffer OutputE4 { uint8_t out8[]; };
+layout(std430, binding = 6) readonly buffer ResidualE4 { uint8_t residual8[]; };
+
+const uint THREADS = 32u * SUBGROUPS;
+const uint BM = 16u * SUBGROUPS;
+const uint BN = 16u * TILES;
+const uint ROWW = OP_WORDS + 1u;           // uvec4 words per staged 32-element row, one of padding
+const uint STEPW = KHR_K * OP_WORDS / 32u; // uvec4 words per KHR_K elements of K
+// Which tiles a subgroup owns: subgroups split the block's MxN tiles row tile by row tile; with fewer rows than
+// subgroups (llvmpipe: 8 lanes, 8x8 tiles) two or more subgroups share a row tile and split its columns.
+const uint SUBGROUP_COUNT = THREADS / KHR_SG;
+const uint ROW_TILES = BM / KHR_M;
+const uint SUBGROUPS_PER_ROW = SUBGROUP_COUNT / ROW_TILES;
+const uint COLUMN_TILES = BN / KHR_N;
+const uint TILES_PER_SUBGROUP = COLUMN_TILES / SUBGROUPS_PER_ROW;
+
+shared uvec4 stageA[BM * ROWW];
+shared uvec4 stageB[BN * ROWW];
+shared float16_t block16[BM * BN];   // the residual in, the result out: f16 [BM][BN]
+
+void main() {
+  const uint thread = gl_LocalInvocationID.x;
+  const uint subgroup = gl_SubgroupID;
+  const uint split = gl_WorkGroupID.x % SPLITK;
+  const uint columnLinear = gl_WorkGroupID.x / SPLITK;
+  const uint batch = columnLinear / pc.columnGroups;
+  const uint columnGroup = columnLinear % pc.columnGroups;
+  const uint blockRow = (gl_WorkGroupID.y + gl_WorkGroupID.z * 65535u) * BM;
+  const uint colBase = columnGroup * BN;
+  const uint outColumn = pc.outputColumnOffset + batch * pc.N;
+  const uint tileRow = (subgroup / SUBGROUPS_PER_ROW) * KHR_M;                       // within the block
+  const uint tileColumn0 = (subgroup % SUBGROUPS_PER_ROW) * TILES_PER_SUBGROUP;      // first column tile
+  const bool rowsValid = blockRow + tileRow < pc.rows;   // (a tile wholly past the end: no MMAs, nothing stored)
+
+  // ---- the prologue: the residual seeds the first step's accumulator (split 0 only), round_f16(residual * scale)
+  const bool seedResidual = (FLAGS & F_RESIDUAL) != 0u && split == 0u;
+  if (seedResidual) {
+    for (uint i = thread; i < BM * BN; i += THREADS) {
+      const uint row = blockRow + i / BN, column = colBase + i % BN;
+      float value = 0.0;
+      if (row < pc.rows) {
+        const uint index = row * pc.outputStride + outColumn + column;
+        value = (FLAGS & F_RESIDUAL_E4) != 0u ? e4m3HwToF32(uint(residual8[index])) : float(residual16[index]);
+        if ((FLAGS & F_SCALE_RESIDUAL) != 0u) value = roundF16(value * float(aux16[pc.auxHalfOffset + column]));
+      }
+      block16[i] = float16_t(value);   // (a half already: exact)
+    }
+    barrier();
+  }
+  MAT_C acc[TILES_PER_SUBGROUP];
+  MAT_C total[TILES_PER_SUBGROUP];
+  [[unroll]] for (uint t = 0u; t < TILES_PER_SUBGROUP; ++t) {
+    if (seedResidual) {
+      LOAD_C(acc[t], block16, tileRow * BN + (tileColumn0 + t) * KHR_N, BN)
+    } else {
+      acc[t] = MAT_C(0.0);
+    }
+    total[t] = MAT_C(0.0);
+  }
+
+  // ---- the k32 steps of this workgroup's partition
+  const uint aColumnBase = pc.inputColumnBase + (((FLAGS & F_BROADCAST_INPUT) != 0u) ? 0u : batch * K);
+  const uint steps = K / 32u / SPLITK;
+  const uint kBegin = split * steps;
+  for (uint s = 0u; s < steps; ++s) {
+    const uint step = kBegin + s;
+    barrier();   // (the previous step's operands are read)
+    for (uint i = thread; i < BM * 2u; i += THREADS) {   // A: BM rows of 32 codes, two uvec4 each
+      const uint r = i >> 1u, w = i & 1u;
+      const uint row = min(blockRow + r, pc.rows - 1u);
+      const uvec4 codes = a4[(row * pc.inputStride + aColumnBase + step * 32u) / 16u + w];
+      STAGE16(stageA, r * ROWW + w * (OP_WORDS / 2u), codes)
+    }
+    for (uint i = thread; i < BN * 2u; i += THREADS) {   // B: the k32 tile of BN columns, contiguous (tile-major)
+      const uint n = i >> 1u, w = i & 1u;
+      const uvec4 codes = b4[((batch * (K / 32u) + step) * pc.Nmatrix + pc.weightColumnOffset + colBase + n) * 2u + w];
+      STAGE16(stageB, n * ROWW + w * (OP_WORDS / 2u), codes)
+    }
+    barrier();
+    if (rowsValid) {
+      [[unroll]] for (uint t = 0u; t < TILES_PER_SUBGROUP; ++t) {
+        MMA_K32(acc[t], stageA, tileRow * ROWW, ROWW, STEPW, stageB, (tileColumn0 + t) * KHR_N * ROWW, ROWW, STEPW,
+                COL_MAJOR)
+      }
+      const uint kb = step * 32u;
+      if (PARTITION != 0u && (((kb + 32u) % PARTITION) == 0u || kb + 32u >= K)) {
+        [[unroll]] for (uint t = 0u; t < TILES_PER_SUBGROUP; ++t) {
+          if (kb < PARTITION) {
+            total[t] = acc[t];
+          } else {
+            ADD_C(total[t], acc[t])
+          }
+          acc[t] = MAT_C(0.0);
+        }
+      }
+    }
+  }
+  if (PARTITION != 0u) {
+    [[unroll]] for (uint t = 0u; t < TILES_PER_SUBGROUP; ++t) acc[t] = total[t];
+  }
+
+  // ---- the epilogue: the tiles as halves in shared memory, then published element by element
+  barrier();   // (every subgroup has read the prologue's block16)
+  if (rowsValid) {
+    [[unroll]] for (uint t = 0u; t < TILES_PER_SUBGROUP; ++t) {
+      STORE_C(acc[t], block16, tileRow * BN + (tileColumn0 + t) * KHR_N, BN)
+    }
+  }
+  barrier();
+  for (uint i = thread; i < BM * BN; i += THREADS) {
+    const uint row = blockRow + i / BN, column = colBase + i % BN;
+    if (row >= pc.rows) continue;
+    float16_t value = block16[i];
+    if (SPLITK > 1u) {   // the partition's raw f16 partial sums, [split][batch][rows][N]; gemm_reduce publishes them
+      out16[split * pc.splitStride + row * pc.N + batch * pc.N * pc.rows + column] = value;
+      continue;
+    }
+    if ((FLAGS & F_SILU) != 0u) value = float16_t(mpCubicSilu(float(value)));
+    const uint index = row * pc.outputStride + outColumn + column;
+    if ((FLAGS & (F_QUANTIZE | F_DUAL)) != 0u) out8[index] = uint8_t(e4m3CodeFromF16Bits(f16Bits(value)));
+    if ((FLAGS & F_QUANTIZE) == 0u) out16[index] = value;
+  }
+}

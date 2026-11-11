@@ -135,6 +135,8 @@ def main():
         raise SystemExit("upscalers_available does not ask vk_fsr3.cpp whether FSR 3.1 runs here")
     if "fsr4_why() == FSR_OK" not in available:
         raise SystemExit("upscalers_available does not ask vk_fsr4.cpp whether FSR 4 runs here")
+    if "ffx::upscale_supported()" not in function(menu, "unsigned upscalers_available() {"):
+        raise SystemExit("upscalers_available does not ask vk_ffx.cpp whether FSR 4 runs here")
     # Off: offered on every PC, shown as what runs, and the game's network left out for it where DLSS's and FSR 4's are
     if "ur::bit(ur::OFF)" not in available:
         raise SystemExit("upscalers_available does not offer Off (no upscaler) everywhere")

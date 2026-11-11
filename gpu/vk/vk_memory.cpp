@@ -100,6 +100,10 @@ struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken
     void unlock() { ReleaseSRWLockExclusive(&l); }
 };
 SrwMutex pools_mu;
+/// (hookshot, diagnostics) Why a binding had to take the lock: a written binding (the lock-free path
+/// serves reads only), this thread's cached pool not matching, or the mirror state needing a
+/// decision. memory_pool_lock_reasons() reads and resets them.
+std::atomic<int64_t> pool_lock_written{0}, pool_lock_cache_miss{0}, pool_lock_mirror{0};
 uint32_t generation = ~0u;
 uint64_t align = 4096;
 uint64_t max_import_size = UINT64_MAX;
@@ -2535,6 +2539,15 @@ void memory_pool_created(uint64_t gpu, uint64_t size) {
     bg_cv.notify_one();
 }
 
+// (super build) Whether one imported pool holds all of [lo, hi): a lookup there imports nothing (vk_texture.cpp
+// upload_unswizzle_gpu asks before it reaches for one)
+int memory_guest_contained(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk(pools_mu);
+    auto it = imported.upper_bound(lo);   // (pools by lo: the last one starting at or below lo)
+    if (it == imported.begin()) return 0;
+    --it;
+    return it->second.lo <= lo && it->second.hi >= hi ? 1 : 0;
+}
 int memory_guest_imported(uint64_t lo, uint64_t hi) {
     std::lock_guard lk(pools_mu);
     auto it = imported.upper_bound(hi);   // (pools by lo: those starting below hi, the last ones checked first)
@@ -2686,6 +2699,13 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment())
             return remember({p->mirror, off, size, 0});
     }
+    // (hookshot, diagnostics) Why the lock-free path above did not answer. It is the costliest
+    //  ParLock site in the renderer -- 250 locks and 2 ms of waiting a command buffer under
+    //  parallel replay -- and the three reasons want different fixes, so they are counted apart.
+    (written ? pool_lock_written : (!tl.p || tl.gen != pools_gen.load(std::memory_order_relaxed))
+                                       ? pool_lock_cache_miss
+                                       : pool_lock_mirror)
+        .fetch_add(1, std::memory_order_relaxed);
     ParLock plk;   // (before pools_mu, always: a mirror sync records into the shared upload command buffer)
     std::lock_guard lk(pools_mu);
     {   // (hookshot, smoothness: import_in_background above. Reads up to 4 MB; not in a parallel replay's segment)
@@ -3653,3 +3673,11 @@ void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, in
     *wb_bytes = st_wb_bytes;
 }
 } // namespace mkwvk
+
+namespace mkwvk {
+void memory_pool_lock_reasons(int64_t* written, int64_t* cache_miss, int64_t* mirror) {
+    *written = pool_lock_written.exchange(0, std::memory_order_relaxed);
+    *cache_miss = pool_lock_cache_miss.exchange(0, std::memory_order_relaxed);
+    *mirror = pool_lock_mirror.exchange(0, std::memory_order_relaxed);
+}
+}

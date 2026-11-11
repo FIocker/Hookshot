@@ -23,6 +23,7 @@ static Pool pool;
 static Pool* last_pool = nullptr;
 static std::mutex pools_mu;
 static std::atomic<uint64_t> pools_gen{1};
+static std::atomic<int64_t> pool_lock_written{0}, pool_lock_cache_miss{0}, pool_lock_mirror{0};   // (the lock-reason counters gpu_buffer_bind keeps)
 static std::atomic<bool> par_active{false};
 static thread_local TlPool tl_pools[1024];
 static uint64_t mirror_epoch = 7, mem_rec_value = 21;

@@ -16,18 +16,20 @@
 #define VK_USE_64_BIT_PTR_DEFINES 0
 #include <vulkan/vulkan.h>
 #include "vk_present_rect.h"
+#include "framegen_methods.h"
+#include <atomic>
 using namespace mkwvk;
 using VmaAllocation = void*;
 constexpr int kMaxMult = 8;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 /* ACTUAL_STATE */
-struct { int framegen = 2, hdr_white = 200, hdr_peak = 1000; } opts;
+struct { int framegen = 2, hdr_white = 200, hdr_peak = 1000, framegen_method = 0; } opts;
 struct { bool push_descriptor = true; std::mutex present_mu; } dev;
 constexpr bool vkCmdPushDescriptorSetKHR = true;
 constexpr uint32_t HDR_ENCODE_COMP_SPV[] = {0};
 bool init_scale() { std::abort(); }
 bool make_pipe(Pipe&, const uint32_t*, size_t, std::initializer_list<VkDescriptorType>, int) { std::abort(); }
-void logf(const char*) { std::abort(); }
+template <class... T> void logf(const char*, T...) {}   // (the Frame generation method in effect, logged once)
 void device_wait_idle_locked() { std::abort(); }
 void drop_img(Img&) { std::abort(); }
 bool make_img(Img&, uint32_t, uint32_t, VkFormat, VkImageUsageFlags) { std::abort(); }
@@ -35,9 +37,22 @@ void to_general(VkCommandBuffer, VkImage) { std::abort(); }
 float hdr_uv[4]{};
 int blits = 0, clears = 0, initializations = 0, sizes = 0, dispatches = 0, copies = 0;
 uint32_t allocated_w = 0, allocated_h = 0;
-namespace fsr3fi { bool wanted = false; bool frames_wanted() { return wanted; } }
+namespace fsr3fi { bool wanted = false; bool frames_wanted() { return wanted; } void reset() {} }
+// (the fork's Frame generation method row: Auto, where FSR 3.1's interpolation is the method that runs, as main's alone)
+namespace fsr3_inputs { struct Frame {}; bool take(Frame&) { return false; } }
+std::atomic<bool> scene_inputs_asked{false};
+int framegen_method(unsigned& available) {
+    available = framegen_methods::always() | framegen_methods::bit(framegen_methods::FSR3);
+    return framegen_methods::AUTO;
+}
+// (the fork's frame generation backends and the camera motion pass, reset where the history goes: none of them runs here)
+namespace camera_motion { void reset() {} }
+namespace dlssg { void reset() {} }
+namespace ffx { void reset() {} }
 int fsr_calls = 0, fsr_result = 1;
-int fsr3fi_frame(VkCommandBuffer, OutSet&, int, uint32_t w, uint32_t h, uint64_t sequence) {
+int dlssg_frames(VkCommandBuffer, OutSet&, int, uint32_t, uint32_t, int, const fsr3_inputs::Frame*) { std::abort(); }
+int ffx_frames(VkCommandBuffer, OutSet&, int, uint32_t, uint32_t, int, const fsr3_inputs::Frame*) { std::abort(); }
+int fsr3fi_frame(VkCommandBuffer, OutSet&, int, uint32_t w, uint32_t h, uint64_t sequence, const fsr3_inputs::Frame*) {
     CHECK(w == allocated_w && h == allocated_h && sequence > 0);
     ++fsr_calls; return fsr_result;
 }

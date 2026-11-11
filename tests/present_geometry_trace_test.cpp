@@ -27,6 +27,7 @@ int aspect_calls = 0;
 float aspect_callback() { ++aspect_calls; return ratio; }
 Host h{aspect_callback}; Host* host = &h;
 struct { int upscale = 0, sharpness = 0, framegen = 0; } opts;
+int window_filter() { return opts.upscale >= 0 && opts.upscale <= 2 ? opts.upscale : 0; }   // (vk_menu.h's)
 std::atomic<uint32_t> present_kind{0};
 bool scaled = false;
 bool encoded = false;

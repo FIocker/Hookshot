@@ -11,6 +11,25 @@ namespace mkwvk {
 /// Something other than the draw path pushed or bound descriptors in the recording (its next push is whole)
 void descriptors_disturbed();
 
+/// (hookshot) What the scene's last frame left behind, for a backend that runs outside the draw
+/// path: the open neural rendering backend (vk_opennr.cpp). The upscalers and frame generation take
+/// theirs from the scene's camera uniform buffer instead (gpu/vk/vk_fsr3_inputs.h). False when the
+/// scene has not been seen yet, which a caller takes as "nothing to give" rather than as a reason to
+/// guess.
+struct SceneFrameInputs {
+    VkImage depth_image = VK_NULL_HANDLE;
+    VkImageView depth_view = VK_NULL_HANDLE;
+    VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    uint32_t render_width = 0, render_height = 0;
+    /// The view projection the scene's draws read, row major, as gpu/vk/vk_camera_motion.h takes it.
+    float view_projection[16]{};
+    /// Its two halves, for a backend that wants them apart (frame generation does).
+    float view[16]{};
+    float projection[16]{};
+    bool have_view_projection = false;
+};
+bool scene_frame_inputs(SceneFrameInputs* out);
+
 /// A graphics pipeline as hookshot_pipelines.bin keeps it (the precompile's notes): what built it
 struct PipeNote {
     uint64_t key, prog, variant;

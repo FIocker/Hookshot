@@ -21,6 +21,8 @@
 #include "dlss_math.h"
 #include "temporal_jitter.h"
 #include "vk_draw.h"   // (descriptors_disturbed)
+#include "vk_ffx.h"    // (hookshot fork: AMD FSR 4, from the same inputs)
+#include "vk_framegen.h"   // (hookshot fork: the frame generation methods that take them)
 #include "vk_fsr3.h"
 #include "vk_fsr3fi.h"
 #include "vk_texture.h"
@@ -207,7 +209,9 @@ VkImageView depth_view(Texture* t) {
 
 } // namespace
 
-bool wanted() { return fsr3_wanted() || fsr3fi::frames_wanted() != 0; }
+bool wanted() {
+    return fsr3_wanted() || fsr3fi::frames_wanted() != 0 || fsr4_wanted() || framegen_scene_inputs_wanted();
+}
 
 void note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                      uint64_t camera_size) {
@@ -321,6 +325,12 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out) 
                      ? (float)std::min(250.0, std::chrono::duration<double, std::milli>(t - s.last_time).count())
                      : 16.667f;
     f.frame = now;
+    f.color_image = s.color.image, f.depth_image = s.depth.image, f.motion_image = s.motion.image;
+    std::memcpy(f.view_projection, cam.current, sizeof f.view_projection);
+    dlss_math::unjitter(f.view_projection, cam.jitter);
+    std::memcpy(f.previous_view_projection, previous, sizeof f.previous_view_projection);
+    std::memcpy(f.projection, projection, sizeof f.projection);
+    f.have_previous = motion;
     s.frame = f, s.have_frame = true;
     s.last_time = t;
     s.last_frame = now;
@@ -358,7 +368,7 @@ MkwVkJitter jitter_sample() {
     // (RX_VK_FSR_JITTER=0: none. 0 too once FSR has not drawn for a while: the camera as the game has it)
     static const bool off = env_switch("RX_VK_FSR_JITTER") == 0;
     State& s = st();
-    if (off || !fsr3_wanted()) return {};
+    if (off || (!fsr3_wanted() && !fsr4_wanted())) return {};   // (super build: FidelityFX FSR 4, vk_ffx.cpp, jitters as FSR 3.1)
     return s.jitter.read(texture_frame_no());
 }
 

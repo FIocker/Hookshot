@@ -1,0 +1,166 @@
+#version 460
+// (hookshot) The khr route's global ViT cosine attention: upstream's global_attend.comp on VK_KHR_cooperative_matrix
+// alone (khr_mma.glsl). One workgroup of 32 invocations per (head, 16-query tile), as upstream's (one subgroup there;
+// four on llvmpipe's 8 lanes). Keys over the 64-padded token count in natural order; the padding keys' exp(0) is
+// subtracted from the denominator once; the E4M3 weights are unnormalized and the reciprocal multiplies the value
+// accumulator afterwards (upstream's docs/network.md, the ViT's four differences).
+//
+// The keys and values are read 64 at a time. With E4M3 matrices they are loaded straight from the buffer, as upstream
+// does; widened to f16 they are staged in shared memory first. The value accumulator lives in shared memory between
+// the chunks as halves: an accumulator is a half after every k32 step anyway, so this changes nothing.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "khr_mma.glsl"
+#include "khr_numerics.glsl"
+
+layout(local_size_x = 32) in;
+
+layout(constant_id = 0) const uint PADDED_TOKENS = 192;
+
+layout(push_constant) uniform Push {
+  uint tokens;
+  uint heads;
+  uint channels;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Normalized { uint8_t qkv[]; };   // E4M3 [paddedTokens][channels*3]
+layout(std430, binding = 5) writeonly buffer Attended { uint8_t attended[]; }; // E4M3 [tokens][channels]
+
+shared float16_t scores[16u * PADDED_TOKENS];
+#if KHR_E4
+shared uint8_t weights[16u * PADDED_TOKENS];
+#define WEIGHTS weights
+#else
+#define WEIGHTS scores               // (the weights as halves, in place of the scores they are made from)
+shared OPT qs[16u * 32u];            // [query][component]
+shared OPT chunk[64u * 32u];         // 64 keys' K (then V): [key][component]
+#endif
+shared float16_t outputs[16u * 32u];
+shared float16_t reciprocals[16];
+
+float16_t vitExpWeight(float16_t score) {
+  // Global-ViT approximation constants (f32 literals converted to half by PTX); the half fma rounded once on any GPU
+  float16_t affine = fmaHalf(score, float16_t(0.08953946828842163), float16_t(1.7093614339828491));
+  affine = clamp(affine, float16_t(1.439453125), float16_t(1.9775390625));
+  uint bits = f16Bits(affine);
+  uint exponentialBits = ((bits << 4u) + 0x4000u) & 0xffffu;
+  return f16FromBits(exponentialBits);
+}
+
+float16_t softmaxPair(uint row, uint base, uint pair, uint parity) {
+  uint key = row * PADDED_TOKENS + base + pair * 2u + parity;
+  precise float16_t a = scores[key] + scores[key + 8u];
+  precise float16_t b = scores[key + 16u] + scores[key + 24u];
+  precise float16_t c = scores[key + 32u] + scores[key + 40u];
+  precise float16_t d = scores[key + 48u] + scores[key + 56u];
+  precise float16_t ab = a + b;
+  precise float16_t abc = ab + c;
+  return abc + d;
+}
+
+float16_t softmax64(uint row, uint base) {
+  precise float16_t e0 = softmaxPair(row, base, 0u, 0u) + softmaxPair(row, base, 1u, 0u);
+  precise float16_t e1 = e0 + softmaxPair(row, base, 2u, 0u);
+  precise float16_t even = e1 + softmaxPair(row, base, 3u, 0u);
+  precise float16_t o0 = softmaxPair(row, base, 0u, 1u) + softmaxPair(row, base, 1u, 1u);
+  precise float16_t o1 = o0 + softmaxPair(row, base, 2u, 1u);
+  precise float16_t odd = o1 + softmaxPair(row, base, 3u, 1u);
+  return even + odd;
+}
+
+void main() {
+  const uint lane = gl_LocalInvocationID.x;
+  const uint head = gl_WorkGroupID.x;
+  const uint qTile = gl_WorkGroupID.y;
+  const uint stride3 = pc.channels * 3u;
+  const uint headBase = head * 96u;
+  const uint qBase = qTile * 16u * stride3 + headBase;
+
+  // ---- S = Q K^T over the keys, 64 at a time, from zero
+#if !KHR_E4
+  for (uint i = lane; i < 16u * 32u; i += 32u) qs[i] = opFromCode(uint(qkv[qBase + (i >> 5u) * stride3 + (i & 31u)]));
+#endif
+  for (uint key0 = 0u; key0 < PADDED_TOKENS; key0 += 64u) {
+#if !KHR_E4
+    barrier();
+    for (uint i = lane; i < 64u * 32u; i += 32u)
+      chunk[i] = opFromCode(uint(qkv[(key0 + (i >> 5u)) * stride3 + headBase + 32u + (i & 31u)]));
+    barrier();
+#endif
+    for (uint t = gl_SubgroupID; t < (16u / KHR_M) * (64u / KHR_N); t += gl_NumSubgroups) {
+      const uint q0 = (t / (64u / KHR_N)) * KHR_M, k0 = (t % (64u / KHR_N)) * KHR_N;
+      MAT_C c = MAT_C(0.0);
+#if KHR_E4
+      MMA_K32(c, qkv, qBase + q0 * stride3, stride3, KHR_K, qkv, (key0 + k0) * stride3 + headBase + 32u, stride3,
+              KHR_K, COL_MAJOR)
+#else
+      MMA_K32(c, qs, q0 * 32u, 32u, KHR_K, chunk, k0 * 32u, 32u, KHR_K, COL_MAJOR)
+#endif
+      STORE_C(c, scores, q0 * PADDED_TOKENS + key0 + k0, PADDED_TOKENS)
+    }
+  }
+  barrier();
+  for (uint i = lane; i < 16u * PADDED_TOKENS; i += 32u) scores[i] = vitExpWeight(scores[i]);
+  barrier();
+
+  if (lane < 16u) {
+    precise float16_t total = float16_t(0.0);
+    for (uint base = 0u; base < PADDED_TOKENS; base += 64u) total = total + softmax64(lane, base);
+    uint padding = PADDED_TOKENS - pc.tokens;
+    if (padding > 0u) {
+      precise float16_t correction = float16_t(roundF16(float(vitExpWeight(float16_t(0.0))) * float(padding)));
+      total = total - correction;
+    }
+    reciprocals[lane] = reciprocalHalf(total);   // (khr_numerics.glsl: RN16 of the exact 1 / total)
+  }
+#if !KHR_E4
+  barrier();   // (the weights replace the scores the totals were read from)
+#endif
+  for (uint i = lane; i < 16u * PADDED_TOKENS; i += 32u) {
+    uint code = e4m3CodeFromF16Bits(f16Bits(scores[i]));
+#if KHR_E4
+    weights[i] = uint8_t(code);
+#else
+    scores[i] = opFromCode(code);
+#endif
+  }
+  for (uint i = lane; i < 16u * 32u; i += 32u) outputs[i] = float16_t(0.0);
+  barrier();
+
+  // ---- O = P V, k32 step by k32 step in key order; the accumulator a half between steps (in `outputs`)
+  for (uint key0 = 0u; key0 < PADDED_TOKENS; key0 += 64u) {
+#if !KHR_E4
+    for (uint i = lane; i < 64u * 32u; i += 32u)
+      chunk[i] = opFromCode(uint(qkv[(key0 + (i >> 5u)) * stride3 + headBase + 64u + (i & 31u)]));
+    barrier();
+#endif
+    for (uint t = gl_SubgroupID; t < (16u / KHR_M) * (32u / KHR_N); t += gl_NumSubgroups) {
+      const uint q0 = (t / (32u / KHR_N)) * KHR_M, c0 = (t % (32u / KHR_N)) * KHR_N;
+      MAT_C c;
+      LOAD_C(c, outputs, q0 * 32u + c0, 32u)
+      [[unroll]] for (uint kb = 0u; kb < 64u; kb += 32u) {
+#if KHR_E4
+        MMA_K32(c, WEIGHTS, q0 * PADDED_TOKENS + key0 + kb, PADDED_TOKENS, KHR_K, qkv,
+                (key0 + kb) * stride3 + headBase + 64u + c0, stride3, KHR_K * stride3, ROW_MAJOR)
+#else
+        MMA_K32(c, WEIGHTS, q0 * PADDED_TOKENS + key0 + kb, PADDED_TOKENS, KHR_K, chunk, kb * 32u + c0, 32u,
+                KHR_K * 32u, ROW_MAJOR)
+#endif
+      }
+      STORE_C(c, outputs, q0 * 32u + c0, 32u)
+    }
+    barrier();
+  }
+
+  for (uint i = lane; i < 16u * 32u; i += 32u) {
+    uint row = i >> 5u, component = i & 31u;
+    uint token = qTile * 16u + row;
+    if (token >= pc.tokens) continue;
+    precise float value = roundF16(float(outputs[i]) * float(reciprocals[row]));
+    attended[token * pc.channels + head * 32u + component] = uint8_t(e4m3CodeFromF16Bits(f16Bits(float16_t(value))));
+  }
+}

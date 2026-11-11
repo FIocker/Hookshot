@@ -1,0 +1,60 @@
+#version 460 core
+// (hookshot) Camera-only motion vectors from depth, for a temporal upscaler.
+//
+// Ocarina hands its own upscaler one colour texture and nothing else, so motion has to be derived
+// rather than taken (docs/upscaling.md). For each pixel this reconstructs the world position from
+// the reversed device depth with the inverse of this frame's view-projection, projects it with the
+// previous frame's, and writes where it was, in render pixels, pointing at the previous frame.
+//
+// This is camera-only by construction: it is right for a world that does not move, and anything
+// moving by itself -- a character, foliage, a particle -- ghosts, because its own motion is not in
+// the depth buffer. That limit belongs in the setting that turns it on, not in a comment nobody
+// reads.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform texture2D in_depth;
+layout(binding = 1, rg16f) uniform writeonly image2D out_motion;
+layout(binding = 1000) uniform sampler point_clamp;
+
+layout(push_constant) uniform Push {
+    mat4 inverse_view_projection;      // this frame's, inverted
+    mat4 previous_view_projection;     // the frame before's
+    ivec2 render_size;
+    // The depth value that means "nothing here". With reversed depth the far plane is 0, and a
+    // pixel at the far plane has no position to reproject, so it gets zero motion rather than a
+    // vector derived from a degenerate reconstruction.
+    float far_depth;
+    float pad;
+} push;
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(at, push.render_size))) {
+        return;
+    }
+    const float depth = texelFetch(sampler2D(in_depth, point_clamp), at, 0).r;
+    if (depth == push.far_depth) {
+        imageStore(out_motion, at, vec4(0.0));
+        return;
+    }
+    // The pixel's centre in clip space. Vulkan's y runs down the screen, so it is flipped here and
+    // flipped back below; getting that wrong gives motion that is right in x and inverted in y,
+    // which looks like a correct upscaler with vertical smearing.
+    const vec2 uv = (vec2(at) + 0.5) / vec2(push.render_size);
+    const vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    const vec4 world = push.inverse_view_projection * clip;
+    if (world.w == 0.0) {
+        imageStore(out_motion, at, vec4(0.0));
+        return;
+    }
+    const vec4 previous = push.previous_view_projection * (world / world.w);
+    if (previous.w <= 0.0) {   // (behind the previous camera: no on-screen history to point at)
+        imageStore(out_motion, at, vec4(0.0));
+        return;
+    }
+    const vec2 previous_ndc = previous.xy / previous.w;
+    const vec2 previous_uv = vec2(previous_ndc.x * 0.5 + 0.5, 0.5 - previous_ndc.y * 0.5);
+    // Toward the previous frame, in render pixels, which is what FSR 3.1 is compiled for
+    // (FFX_FSR3UPSCALER_OPTION_LOW_RESOLUTION_MOTION_VECTORS=1, unjittered).
+    imageStore(out_motion, at, vec4((previous_uv - uv) * vec2(push.render_size), 0.0, 0.0));
+}

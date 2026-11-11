@@ -1,0 +1,159 @@
+#version 460
+// (hookshot) The khr route's f16 GEMM: upstream's gemm_f16.comp for the khr route (khr_mma.glsl). The network's two f16
+// boundaries, the 16 -> 32 input adapter and the 32 -> 4 head: f16 A and B, an f16 accumulator from zero rounded after
+// every k16 step. Same host contract as upstream's (push constants, bindings, specialization constants, one workgroup
+// of 128 invocations per 64 rows).
+//
+// Two ways to a step, by variant:
+// * f16 accumulators (KHR_ACC32 0, NVIDIA's shapes): one f16 16x16x16 MMA per step, as upstream's kernel -- the same
+//   bytes. The tiles go through shared memory as halves before they are published element by element.
+// * otherwise no matrices at all: the step in integer arithmetic, exactly the one-group model the harness measured on
+//   Blackwell (16 products and the incoming half as one fixed-point sum with 25 fraction bits below the largest
+//   exponent, truncated, then rounded to half: upstream's ref::adaF16Fdpa8 with one group). An f32 accumulator cannot
+//   do this step faithfully: f16 products have 22 significant bits, so a sum of 16 of them is rounded to f32 before it
+//   is rounded to half, and on an RTX 5060 Ti that double rounding left 274 of 3.9 million adapter outputs an ulp off
+//   (FP8 products have 8 bits and their k32 sums stayed exact in f32: no FP8 kernel differed). These two GEMMs are
+//   0.9% of the network's arithmetic (upstream's docs/execution.md), so being exact here costs little, on any GPU.
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "khr_mma.glsl"
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = 0) const uint K = 16;
+layout(constant_id = 1) const uint TILE_N = 32;   // padded N (multiple of 16)
+layout(constant_id = 2) const uint FLAGS = 0;
+
+const uint F_QUANTIZE = 16u;   // main output E4M3 bytes (binding 5)
+const uint F_DUAL = 32u;       // f16 to binding 2 and E4M3 to binding 5
+const uint F_OUT_F32 = 256u;   // f32 output to binding 7
+
+layout(push_constant) uniform Push {
+  uint rows;
+  uint N;             // valid output columns
+  uint inputStride;   // A row stride (elements)
+  uint outputStride;  // output row stride (elements)
+} pc;
+
+layout(std430, binding = 0) readonly buffer InputA { float16_t a[]; };   // f16 [rows, padded to 64][inputStride]
+layout(std430, binding = 1) readonly buffer InputB { float16_t b[]; };   // f16 [K][TILE_N]
+layout(std430, binding = 2) writeonly buffer OutputHalf { float16_t out16[]; };
+layout(std430, binding = 5) writeonly buffer OutputE4 { uint8_t out8[]; };
+layout(std430, binding = 7) writeonly buffer OutputFloat { float out32[]; };
+
+const uint ROWS = 64u;
+
+void publish(uint row, uint column, float16_t value) {
+  const uint index = row * pc.outputStride + column;
+  if ((FLAGS & F_OUT_F32) != 0u) out32[index] = float(value);
+  else if ((FLAGS & F_QUANTIZE) != 0u) out8[index] = uint8_t(e4m3CodeFromF16Bits(f16Bits(value)));
+  else out16[index] = value;
+  if ((FLAGS & F_DUAL) != 0u) out8[index] = uint8_t(e4m3CodeFromF16Bits(f16Bits(value)));
+}
+
+#if KHR_ACC32
+// ---- one k16 step in integers: upstream's src/reference.cpp adaF16Fdpa8 and fixedToF16, line for line, with one group
+// of 16 products and F16_F fraction bits (the harness's "one fused group" model, which this GPU's tensor cores equal)
+const int F16_F = 25;
+
+int f16Exponent(float value) { return max(int((floatBitsToUint(abs(value)) >> 23u) & 0xffu) - 127, -14); }
+
+uint roundShiftRightEven(uint value, uint shift) {
+  if (shift == 0u) return value;
+  if (shift > 31u) return 0u;
+  uint truncated = value >> shift;
+  uint remainder = value & ((1u << shift) - 1u);
+  uint halfway = 1u << (shift - 1u);
+  return truncated + ((remainder > halfway || (remainder == halfway && (truncated & 1u) != 0u)) ? 1u : 0u);
+}
+
+// exact signed fixed-point sum -> IEEE half (the 32-bit magnitude as the reference has it: F16_F keeps it in range)
+float fixedToF16(int64_t fixedSum, int binaryExponent) {
+  if (fixedSum == 0l) return 0.0;
+  bool negative = fixedSum < 0l;
+  uint magnitude = uint(negative ? -fixedSum : fixedSum);
+  int msb = findMSB(magnitude);
+  int valueExponent = msb + binaryExponent;
+  uint halfBits = negative ? 0x8000u : 0u;
+  if (valueExponent >= -14) {
+    uint significand = msb > 10 ? roundShiftRightEven(magnitude, uint(msb - 10)) : magnitude << uint(10 - msb);
+    if (significand >= 2048u) { significand = 1024u; valueExponent += 1; }
+    if (valueExponent >= 16) halfBits |= 0x7c00u;
+    else halfBits |= (uint(valueExponent + 15) << 10u) | (significand - 1024u);
+  } else {
+    int subnormalScale = binaryExponent + 24;
+    uint mantissa = subnormalScale >= 0 ? magnitude << uint(subnormalScale)
+                                        : roundShiftRightEven(magnitude, uint(-subnormalScale));
+    halfBits |= min(mantissa, 1024u);
+  }
+  return float(f16FromBits(halfBits));
+}
+
+// accumulator (a half) + the 16 products a[i] b[i] (halves), one fixed-point group, rounded to half
+float f16Step(float accumulator, float a[16], float b[16]) {
+  int maximumExponent = -21;
+  if (accumulator != 0.0) maximumExponent = f16Exponent(accumulator);
+  for (uint i = 0u; i < 16u; ++i)
+    if (a[i] != 0.0 && b[i] != 0.0) maximumExponent = max(maximumExponent, f16Exponent(a[i]) + f16Exponent(b[i]));
+  int64_t fixedSum = 0l;
+  if (accumulator != 0.0) {
+    int exponent = f16Exponent(accumulator);
+    precise float scaled = ldexp(ldexp(accumulator, -exponent), exponent - maximumExponent + F16_F);
+    fixedSum += int64_t(trunc(scaled));
+  }
+  for (uint i = 0u; i < 16u; ++i) {
+    if (a[i] != 0.0 && b[i] != 0.0) {
+      int ea = f16Exponent(a[i]), eb = f16Exponent(b[i]);
+      precise float product = ldexp(a[i], -ea) * ldexp(b[i], -eb);   // (22 bits: exact)
+      fixedSum += int64_t(trunc(ldexp(product, ea + eb - maximumExponent + F16_F)));
+    }
+  }
+  return fixedToF16(fixedSum, maximumExponent - F16_F);
+}
+
+void main() {
+  const uint rowBase = (gl_WorkGroupID.y + gl_WorkGroupID.z * 65535u) * ROWS;
+  for (uint i = gl_LocalInvocationID.x; i < ROWS * TILE_N; i += 128u) {
+    const uint row = rowBase + i / TILE_N, column = i % TILE_N;
+    if (row >= pc.rows || column >= pc.N) continue;
+    float accumulator = 0.0;
+    for (uint kb = 0u; kb < K; kb += 16u) {
+      float x[16], w[16];
+      for (uint j = 0u; j < 16u; ++j) {
+        x[j] = float(a[row * pc.inputStride + kb + j]);
+        w[j] = float(b[(kb + j) * TILE_N + column]);
+      }
+      accumulator = f16Step(accumulator, x, w);
+    }
+    publish(row, column, float16_t(accumulator));   // (a half already: exact)
+  }
+}
+#else
+const uint TILE_COLUMNS = TILE_N / KHR_N;
+shared float16_t tileC[ROWS * TILE_N];
+
+void main() {
+  const uint thread = gl_LocalInvocationID.x;
+  const uint rowBase = (gl_WorkGroupID.y + gl_WorkGroupID.z * 65535u) * ROWS;
+  // (A rows past the end are the activation's zeroed padding rows, which its allocation always has: kernels.h)
+  for (uint t = gl_SubgroupID; t < (ROWS / KHR_M) * TILE_COLUMNS; t += gl_NumSubgroups) {
+    const uint tr = (t / TILE_COLUMNS) * KHR_M, tc = (t % TILE_COLUMNS) * KHR_N;
+    MAT_C c = MAT_C(0.0);
+    for (uint kb = 0u; kb < K; kb += 16u) {
+      HMMA_K16(c, a, (rowBase + tr) * pc.inputStride + kb, pc.inputStride, KHR_HK, b, kb * TILE_N + tc, TILE_N,
+               KHR_HK * TILE_N, ROW_MAJOR)
+    }
+    STORE_C(c, tileC, tr * TILE_N + tc, TILE_N)
+  }
+  barrier();
+  for (uint i = thread; i < ROWS * TILE_N; i += 128u) {
+    const uint row = rowBase + i / TILE_N, column = i % TILE_N;
+    if (row >= pc.rows || column >= pc.N) continue;
+    publish(row, column, tileC[i]);
+  }
+}
+#endif

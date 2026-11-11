@@ -82,12 +82,36 @@ HLE(_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE) {
     *(uint16_t *)GP(ARG(0)) = rx_option(HOS_OPT_HDR_NATIVE, 0) ? (uint16_t)rx_option(HOS_OPT_HDR_WHITE, 203) : 203;
     RET(0);
 }
+/* (hookshot) HOS_DISPLAY_VRR=1: tell the game the display does variable refresh.
+ *
+ * This is what holds the frame rate at 60, and it took three experiments to find. The game's
+ * limiter at +0xfc is written by f_804fc0f0, which stores a rate only when a mode is 1, the rate is
+ * 40 or more, and the byte at +0x232 is set. That byte reads 0, and raising the limiter or the
+ * engine's controller words from outside does not stick: the game writes them back every frame,
+ * because it believes the display cannot do better. It believes that because this very function
+ * answered no, and because SetDisplay120HzRefreshRateCapability and
+ * QueryDisplayCurrentRefreshRate were unimplemented imports.
+ *
+ * Off by default: it changes what the game believes about the display, and on a 60 Hz screen a game
+ * that paces itself faster than the panel gains nothing and may tear. The real-time frame step
+ * keeps game speed honest at whatever rate comes out (main+0x6e6cc4, above). */
+static int display_vrr(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_DISPLAY_VRR");
+        on = e && *e && *e != '0';
+    }
+    return on;
+}
 /* nn::vi::QueryDisplayVrrSupported(bool*, Display const*) -> Result */
 HLE(_ZN2nn2vi24QueryDisplayVrrSupportedEPbPKNS0_7DisplayE) {
-    *(uint8_t *)GP(ARG(0)) = 0;
+    *(uint8_t *)GP(ARG(0)) = display_vrr() ? 1 : 0;
     RET(0);
 }
 HLE(_ZN2nn2vi23SetDisplayVrrCapabilityEPNS0_7DisplayEb) { RET(0); }
+/* nn::vi::SetDisplay120HzRefreshRateCapability(Display*, bool) -> Result. An unimplemented import
+   before this: the game offers 120 Hz and nothing answered. Accepting is all it wants. */
+HLE(_ZN2nn2vi36SetDisplay120HzRefreshRateCapabilityEPNS0_7DisplayEb) { RET(0); }
 HLE(_ZN2nn2vi28SetLayerExtendedSwapIntervalEPNS0_5LayerEii) { RET(0); }
 HLE(_ZN2nn2vi30ClearLayerExtendedSwapIntervalEPNS0_5LayerE) { RET(0); }
 

@@ -1,0 +1,166 @@
+#version 460
+// (hookshot) The khr route's 8x8 window cosine attention: upstream's window_attend.comp on VK_KHR_cooperative_matrix
+// alone (khr_mma.glsl). One workgroup of 128 invocations per (window, head), as upstream's; the same steps in the same
+// order, with the keys in physical (tiled) order:
+//   S = Q K^T + prior          one k32 step per tile, the learned prior tile as the incoming f16 accumulator
+//   w = expWeight(S)          the network's exponential (a bit trick on the half)
+//   p = E4M3(w * f16(1/sum))   upstream's softmax reduction order, element by element in shared memory
+//   O = p V                    two k32 steps over the 64 keys from a zero accumulator, published as E4M3
+// The tiles are spread over however many subgroups the workgroup has (four of 32 lanes; sixteen on llvmpipe's 8).
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "khr_mma.glsl"
+#include "khr_numerics.glsl"
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform Push {
+  uint width;
+  uint height;
+  uint channels;   // heads * 32
+  uint heads;
+  uint shiftX;     // window origin offset (0 or 4)
+  uint shiftY;
+  uint windowsX;   // ceil((width + shiftX) / 8)
+  uint windowCount;
+} pc;
+
+layout(std430, binding = 0) readonly buffer Normalized { uint8_t qkv[]; };  // E4M3 [tokens][channels*3]
+layout(std430, binding = 1) readonly buffer Prior { float16_t prior[]; };   // [heads][64 query][64 physical key]
+layout(std430, binding = 5) writeonly buffer Attended { uint8_t attended[]; }; // E4M3 [tokens][channels]
+
+shared OPT qs[64 * 32];           // [query][component]
+shared OPT ks[64 * 32];           // [physical key][component]
+shared OPT vs[64 * 32];           // [physical key][component]
+shared float16_t scores[64 * 64]; // [query][physical key]
+#if KHR_E4
+shared uint8_t weights[64 * 64];  // E4M3 [query][physical key]
+#define WEIGHTS weights
+#else
+#define WEIGHTS scores            // (the weights as halves, in place of the scores they are made from)
+#endif
+shared float16_t outputs[64 * 32];
+
+uint inverseTiledToken(uint token) {
+  uint tile = token >> 4u, within = token & 15u;
+  uint x = (tile & 1u) * 4u + (within & 3u);
+  uint y = (tile >> 1u) * 4u + (within >> 2u);
+  return y * 8u + x;
+}
+
+// upstream's exponential: f32 affine, rounded to half (on the bits here), half clamp, exponent-field remap
+float16_t expWeight(float16_t score) {
+  precise float affine32 = fma(float(score), 0.044921875, 1.30078125);
+  float16_t affine = clamp(float16_t(roundF16(affine32)), float16_t(1.03125), float16_t(1.5693359375));
+  uint bits = f16Bits(affine);
+  uint exponentialBits = ((bits << 5u) + 0x8000u) & 0xffffu;
+  return f16FromBits(exponentialBits);
+}
+
+// upstream's softmax reduction (keys in physical order): eight 8-key fragments per column pair, then the four column
+// pairs, then the even / odd halves; every add a half add
+float16_t softmaxPair(uint row, uint pair, uint parity) {
+  uint key = pair * 2u + parity;
+  precise float16_t blocks01 = scores[row * 64u + key] + scores[row * 64u + key + 8u];
+  precise float16_t blocks23 = scores[row * 64u + key + 16u] + scores[row * 64u + key + 24u];
+  precise float16_t blocks45 = scores[row * 64u + key + 32u] + scores[row * 64u + key + 40u];
+  precise float16_t blocks67 = scores[row * 64u + key + 48u] + scores[row * 64u + key + 56u];
+  precise float16_t a = blocks01 + blocks23;
+  precise float16_t b = a + blocks45;
+  return b + blocks67;
+}
+
+float16_t softmaxSum(uint row) {
+  precise float16_t e0 = softmaxPair(row, 0u, 0u) + softmaxPair(row, 1u, 0u);
+  precise float16_t e1 = e0 + softmaxPair(row, 2u, 0u);
+  precise float16_t even = e1 + softmaxPair(row, 3u, 0u);
+  precise float16_t o0 = softmaxPair(row, 0u, 1u) + softmaxPair(row, 1u, 1u);
+  precise float16_t o1 = o0 + softmaxPair(row, 2u, 1u);
+  precise float16_t odd = o1 + softmaxPair(row, 3u, 1u);
+  return even + odd;
+}
+
+void main() {
+  const uint thread = gl_LocalInvocationID.x;
+  const uint head = gl_WorkGroupID.x;
+  const uint window = gl_WorkGroupID.y + gl_WorkGroupID.z * 65535u;
+  if (window >= pc.windowCount) return;
+  const int windowX = int((window % pc.windowsX) * 8u) - int(pc.shiftX);
+  const int windowY = int((window / pc.windowsX) * 8u) - int(pc.shiftY);
+  const uint stride3 = pc.channels * 3u;
+  const uint headBase = head * 96u;
+
+  // Q (query order), K/V (physical key order). Tokens outside the field are zero vectors: a zero key and value, whose
+  // score (prior + 0) still enters the softmax (upstream's docs/network.md).
+  for (uint i = thread; i < 64u * 32u; i += 128u) {
+    uint token = i >> 5u, component = i & 31u;
+    int qx = windowX + int(token & 7u), qy = windowY + int(token >> 3u);
+    uint q = 0u;
+    if (qx >= 0 && qy >= 0 && qx < int(pc.width) && qy < int(pc.height))
+      q = uint(qkv[(uint(qy) * pc.width + uint(qx)) * stride3 + headBase + component]);
+    qs[i] = opFromCode(q);
+    uint keyLocal = inverseTiledToken(token);
+    int kx = windowX + int(keyLocal & 7u), ky = windowY + int(keyLocal >> 3u);
+    uint k = 0u, v = 0u;
+    if (kx >= 0 && ky >= 0 && kx < int(pc.width) && ky < int(pc.height)) {
+      uint keyBase = (uint(ky) * pc.width + uint(kx)) * stride3 + headBase;
+      k = uint(qkv[keyBase + 32u + component]);
+      v = uint(qkv[keyBase + 64u + component]);
+    }
+    ks[i] = opFromCode(k);
+    vs[i] = opFromCode(v);
+  }
+  barrier();
+
+  // S = Q K^T with the learned prior as the incoming accumulator (read straight from its buffer)
+  const uint priorBase = head * 4096u;
+  for (uint t = gl_SubgroupID; t < (64u / KHR_M) * (64u / KHR_N); t += gl_NumSubgroups) {
+    const uint q0 = (t / (64u / KHR_N)) * KHR_M, k0 = (t % (64u / KHR_N)) * KHR_N;
+    MAT_C c;
+    LOAD_C(c, prior, priorBase + q0 * 64u + k0, 64u)
+    MMA_K32(c, qs, q0 * 32u, 32u, KHR_K, ks, k0 * 32u, 32u, KHR_K, COL_MAJOR)
+    STORE_C(c, scores, q0 * 64u + k0, 64u)
+  }
+  barrier();
+
+  for (uint i = thread; i < 64u * 64u; i += 128u) scores[i] = expWeight(scores[i]);
+  barrier();
+  if (thread < 64u) {
+    const uint row = thread;
+    float16_t total = softmaxSum(row);
+    float16_t reciprocal = reciprocalHalf(total);   // (khr_numerics.glsl: RN16 of the exact 1 / total)
+    for (uint key = 0u; key < 64u; ++key) {   // (this row only, and its total is taken: the in-place form is safe)
+      precise float16_t normalized = scores[row * 64u + key] * reciprocal;
+      uint code = e4m3CodeFromF16Bits(f16Bits(normalized));
+#if KHR_E4
+      weights[row * 64u + key] = uint8_t(code);
+#else
+      scores[row * 64u + key] = opFromCode(code);
+#endif
+    }
+  }
+  barrier();
+
+  // O = P V over the 64 physical keys: two k32 steps from zero
+  for (uint t = gl_SubgroupID; t < (64u / KHR_M) * (32u / KHR_N); t += gl_NumSubgroups) {
+    const uint q0 = (t / (32u / KHR_N)) * KHR_M, c0 = (t % (32u / KHR_N)) * KHR_N;
+    MAT_C c = MAT_C(0.0);
+    [[unroll]] for (uint kb = 0u; kb < 64u; kb += 32u) {
+      MMA_K32(c, WEIGHTS, q0 * 64u + kb, 64u, KHR_K, vs, kb * 32u + c0, 32u, KHR_K * 32u, ROW_MAJOR)
+    }
+    STORE_C(c, outputs, q0 * 32u + c0, 32u)
+  }
+  barrier();
+
+  for (uint i = thread; i < 64u * 32u; i += 128u) {
+    uint token = i >> 5u, component = i & 31u;
+    int qx = windowX + int(token & 7u), qy = windowY + int(token >> 3u);
+    if (qx < 0 || qy < 0 || qx >= int(pc.width) || qy >= int(pc.height)) continue;
+    uint index = (uint(qy) * pc.width + uint(qx)) * pc.channels + head * 32u + component;
+    attended[index] = uint8_t(e4m3CodeFromF16Bits(f16Bits(outputs[i])));
+  }
+}

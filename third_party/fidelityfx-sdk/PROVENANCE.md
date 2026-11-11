@@ -20,7 +20,7 @@ No runtime library is needed, and none is included: the passes are compiled from
 `gpu/vk/shaders/fsr3_*_comp_spv.h` by `scripts/fsr3_shaders.py`, which is also what
 `tests/test_fsr3_shaders.py` runs to prove the checked-in headers still match. This is the SDK-source
 route rather than AMD's FidelityFX API, which would load AMD's own Vulkan runtime and is Windows
-only: these passes run on any GPU, on Windows and Linux alike.
+only; see `docs/upscaling.md`.
 
 Nothing in this folder is edited. A change belongs in a new folder with its own note, per
 `CONTRIBUTING.md`.

@@ -126,7 +126,7 @@ int main(void) {
 #include <cstdlib>
 #include <cstring>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
-enum MenuTab { TAB_CONTROLS };
+enum MenuTab { TAB_CONTROLS, TAB_NEURAL = 5 };   // (TAB_NEURAL: the fork's Neural tab, whose rows ini_key saves as nr_<name>)
 struct Options { int output_res = 0, vsync = 0, resolution = 0, fps_cap = 0, upscale = 0, dlss = 0, handheld = 0, mesh_mode = 0, stick_dead_zone = 0; } opts;
 static int parse_output(const char* text) { return atoi(text); }   // (the Output row's own parse: not what this checks)
 ''' + block(menu, "struct Row {") + ";\n" + block(menu, "const char* tx_stick_dead_zone(") + "\n" + \

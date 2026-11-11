@@ -1132,6 +1132,16 @@ bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     default: return false;
     }
     if (!unswizzle_ready()) return false;
+    // (super build) Only from a pool already imported: an import made here, for one upload, took 22-25 ms on the replay
+    // thread (the driver locks the pages): three of them when the camera turns to the Deku Tree, a 60 ms hitch. The CPU
+    // path (several threads from 4 MB) does a 15 MB level in a few ms. RX_VK_UNSWIZZLE_IMPORT=1: import as before
+    static const bool may_import = getenv("RX_VK_UNSWIZZLE_IMPORT") != nullptr;
+    if (!may_import) {   // (a virtual pool's address above 1 TB: its guest address, as gpu_buffer translates it)
+        uint64_t avail = 0;
+        if (!host->gpu_ptr(tex.gpu, &avail) || avail < total) return false;
+        const uint64_t guest = tex.gpu < (1ull << 40) ? tex.gpu : host->gpu_guest(tex.gpu);
+        if (!memory_guest_contained(guest, guest + total)) return false;
+    }
     const BufferRef src = gpu_buffer(tex.gpu, total);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 16);
     if (!src || (src.offset % align)) return false;
@@ -1564,7 +1574,9 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                     // course maps the title loads at each scene change, 6 of 349 MB, took ~100 ms each on one. Their
                     // storage is sparse: each thread gathers its own rows, 8 MB at a time, rather than all of it
                     // being copied first (a 349 MB scratch beside the 349 MB staged))
-                    const uint32_t nthreads = block_bytes >= (16u << 20) && g.td == 1 && !g.tile_d
+                    // (super build: from 4 MB, not 16: the scene-size targets uploaded when the camera turns to the Deku Tree,
+                    // 2779 x 1318 RGBA8 = 15 MB, took ~20 ms each on one thread, three in one frame: a 50 ms hitch)
+                    const uint32_t nthreads = block_bytes >= (4u << 20) && g.td == 1 && !g.tile_d
                                                   ? std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u) : 1u;
                     uint64_t avail = 0;
                     const uint8_t* direct = host->gpu_ptr(tex.gpu + from, &avail);
@@ -3129,13 +3141,30 @@ void texture_written(Texture* tex, const char* why) {
 }
 
 
+/// (hookshot, diagnostics) Why the quick path gave up, counted. It is the busiest ParLock site in
+/// the renderer (352 locks a command buffer under parallel replay), and "it misses" is not a thing
+/// anyone can act on -- whether it is the upload check or the once-an-epoch check decides whether
+/// there is anything to win here at all. Read by texture_touch_misses().
+std::atomic<int64_t> touch_miss_upload{0}, touch_miss_epoch{0}, touch_miss_unuploaded{0};
+
 bool texture_touch_quick(Texture* tex, bool for_sampling) {
     tex->last_frame = frame_no;   // (the same values whichever thread stores them)
     tex->last_value = rec_value;
     if (!for_sampling) return true;
     if (tex->gpu_written && !tex->released && !tex->only_cleared) return true;
-    if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) return false;
-    return tex->uploaded && tex->checked_epoch == epoch;
+    if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) {
+        touch_miss_upload.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (tex->uploaded && tex->checked_epoch == epoch) return true;
+    (tex->uploaded ? touch_miss_epoch : touch_miss_unuploaded).fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+void texture_touch_misses(int64_t* upload, int64_t* epoch_out, int64_t* unuploaded) {
+    *upload = touch_miss_upload.exchange(0, std::memory_order_relaxed);
+    *epoch_out = touch_miss_epoch.exchange(0, std::memory_order_relaxed);
+    *unuploaded = touch_miss_unuploaded.exchange(0, std::memory_order_relaxed);
 }
 void texture_gpu_wrote(uint64_t gpu, uint64_t size) {
     if (!gpu || !size) return;

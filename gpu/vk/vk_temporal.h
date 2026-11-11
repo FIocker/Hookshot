@@ -122,4 +122,13 @@ struct TemporalEngine {
 /// Runs f a few frames on, to free what work in flight may still use. Called by the engines with the chain's lock held
 void temporal_later(std::function<void()> f);
 
+// ---- (super build) what the chain gives the renderer's other passes ----
+
+/// Whether DLSS 5 neural rendering ran in the chain in the last frames (on the engine's picture before the HUD, or on the
+/// scene before the upscaler: the Neural tab's Stage row): the present then leaves its own pass out
+bool dlss_nr_before_hud();
+/// A temporal upscaler (DLSS, DLAA, FSR 4, FSR 3.1) drew this frame's upscale (note_), and whether one did in the last frames
+void note_temporal_upscale();
+bool temporal_upscale_recent();
+
 } // namespace mkwvk

@@ -19,9 +19,16 @@
 
 #include <cmath>
 
+#include "vk_temporal.h"   // (super build: temporal_upscale_recent, window_sharpness)
 #include "vk_framegen.h"
+#include "dlss_math.h"         // (hookshot fork: the scene's clip to the frame before's, for DLSS frame generation)
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
+
+#include "vk_camera_motion.h"   // (hookshot fork: the open neural rendering backend's motion, reset across a gap)
+#include "vk_dlssg.h"
+#include "vk_ffx.h"   // (hookshot fork: AMD FSR 4 frame generation)
+#include "framegen_methods.h"
 #include "vk_menu.h"
 #include "vk_present_rect.h"
 #include "vk_texture.h"
@@ -506,7 +513,21 @@ bool framegen_wanted(int menu_value, int allow) {
 
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
+    // (super build: under Streamline frame generation, Streamline's present makes the frames)
     return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
+}
+
+// (super build) The Sharpness row's strength as the window's RCAS gets it. Over a temporal upscaler's picture (DLSS, DLAA,
+// FSR 3.1) RCAS at full strength turned dense grass into an oily, painted smear whenever the camera moved: the reconstruction's
+// motion-time softness sharpened into false detail. There it is a share of the row, RX_VK_TEMPORAL_SHARPEN percent (20 by
+// default; 100: the row as it is, 0: none)
+int window_sharpness() {
+    static const int share = getenv("RX_VK_TEMPORAL_SHARPEN") ? std::clamp(atoi(getenv("RX_VK_TEMPORAL_SHARPEN")), 0, 100) : 20;
+    if (!opts.sharpness || !temporal_upscale_recent()) return opts.sharpness;
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true))
+        logf("vk: sharpness over a temporal upscaler: %d%% of the row's %d%% (RX_VK_TEMPORAL_SHARPEN)", share, opts.sharpness);
+    return opts.sharpness * share / 100;
 }
 
 // Ultrawide's menus (the Insert menu's Ultrawide menus): which of nx2/oot_wide.py's keep-list screens keep the whole picture, told
@@ -544,8 +565,9 @@ std::atomic<WideSides> wide_now;   // (wide_sides_tick's, each present)
 bool wide_sides_possible() { return wide_possible.load(std::memory_order_relaxed); }
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
+    const int sharpness = window_sharpness();
     const WideSides wide = wide_now.load(std::memory_order_relaxed);   // (wide_sides_tick, each present)
-    if (!opts.upscale && !opts.sharpness && !wide.side) return VK_NULL_HANDLE;
+    if (!window_filter() && !sharpness && !wide.side) return VK_NULL_HANDLE;
     if (!src || !image || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
     const PresentSourceRect source = present_source_rect(sw, sh, crop);
     if (!source.w || !source.h) return VK_NULL_HANDLE;
@@ -594,7 +616,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         scale.scaled_w = dw, scale.scaled_h = dh;
         to_general(cmd, scale.scaled.image);
     }
-    struct { int mode; float sharp; float x0, x1; int side; } pc{opts.upscale, opts.sharpness / 100.0f, wide.x0, 1.0f - wide.x0, wide.side};
+    struct { int mode; float sharp; float x0, x1; int side; } pc{window_filter(), sharpness / 100.0f, wide.x0, 1.0f - wide.x0, wide.side};
     if (wide.side == 1) {   // (the blurred sides: first the picture at 1/8, each pixel the mean of its 8 x 8, which they blur)
         // (from #1448's checked source rectangle, as the crop above: the picture src now holds)
         const uint32_t smw = std::max(1u, source.w / 8), smh = std::max(1u, source.h / 8);
@@ -625,7 +647,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         reported = true;
         logf("vk: upscale dispatched: mode %d, sharpness %d%% (of RCAS's strongest, neighbours one source pixel apart), source %ux%u, "
              "crop request %d,%d %dx%d, destination %ux%u",
-             opts.upscale, opts.sharpness, sw, sh, crop ? crop[0] : 0, crop ? crop[1] : 0,
+             window_filter(), sharpness, sw, sh, crop ? crop[0] : 0, crop ? crop[1] : 0,
              crop ? crop[2] : (int)sw, crop ? crop[3] : (int)sh, dw, dh);
     }
     return scale.scaled.image;
@@ -679,19 +701,58 @@ VkImage framegen_made_image(uint32_t* w, uint32_t* h) {
     return fg.recorded->frame[0].image;
 }
 
+/// (hookshot) A 4x4 inverse and a 4x4 product, row major, in doubles. Frame generation needs the
+/// projection's inverse and the clip-to-previous-clip pair, and a float inverse of a projection with
+/// a far plane in the thousands loses the precision the reprojection depends on.
+bool invert4x4(const float* m, float* out) {
+    double a[16], inv[16];
+    for (int i = 0; i < 16; i++) a[i] = (double)m[i];
+    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+    const double det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12];
+    if (det > -1e-12 && det < 1e-12) return false;
+    for (int i = 0; i < 16; i++) out[i] = (float)(inv[i] / det);
+    return true;
+}
+
+void multiply4x4(const float* a, const float* b, float* out) {
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            double sum = 0;
+            for (int k = 0; k < 4; k++) sum += (double)a[r * 4 + k] * (double)b[k * 4 + c];
+            out[r * 4 + c] = (float)sum;
+        }
+}
+
 /// (hookshot) The made frame of a 2x set by AMD FSR 3.1's frame interpolation (vk_fsr3fi.h), from this frame's colour and
 /// the scene's depth and motion (vk_fsr3_inputs.h): 1 when it made it into set.frame[0], 0 when it did not (no inputs this
 /// present, a reset, anything not made), which leaves the set to the interpolation below. sequence: framegen_record's count
-/// of its presents (one it did not hand over, a gap among them, makes the next one a reset: vk_fsr3fi.h Inputs::sequence)
-int fsr3fi_frame(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_t uh, uint64_t sequence) {
+/// of its presents (one it did not hand over, a gap among them, makes the next one a reset: vk_fsr3fi.h Inputs::sequence).
+/// (hookshot fork) scene: this present's inputs, taken once for every method in the chain (null: none this present)
+int fsr3fi_frame(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_t uh, uint64_t sequence,
+                 const fsr3_inputs::Frame* scene) {
     // (every 600 presents asked: how many FSR made, and how many it left to the interpolation below and why)
     static uint64_t asked = 0, made = 0, no_inputs = 0;
     if (++asked % 600 == 0)
         logf("vk: fsr3fi: %llu of the last 600 made frames by FSR 3.1, %llu without its inputs (the renderer's own made them)",
              (unsigned long long)made, (unsigned long long)no_inputs),
             made = no_inputs = 0;
-    fsr3_inputs::Frame f;
-    if (!fsr3_inputs::take(f)) return no_inputs++, 0;
+    if (!scene) return no_inputs++, 0;
+    const fsr3_inputs::Frame& f = *scene;
     fsr3fi::Inputs in;
     in.color = fg.frames[cur].view;
     in.color_image = fg.frames[cur].image;
@@ -716,6 +777,144 @@ int fsr3fi_frame(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_
              uh, f.width, f.height);
     }
     return 1;
+}
+
+/// (hookshot fork) The camera's view (world to camera) from the scene's matrices (vk_fsr3_inputs.h Frame): the inverse of
+/// the projection times the view-projection, row major. False when the projection cannot be inverted
+bool scene_view(const fsr3_inputs::Frame& f, float view[16]) {
+    float inverse_projection[16];
+    if (!invert4x4(f.projection, inverse_projection)) return false;
+    multiply4x4(inverse_projection, f.view_projection, view);
+    return true;
+}
+
+/// (hookshot) The made frames of one present, by DLSS Frame Generation: how many were made, 0 when it could not run. Each
+/// one is copied into the set the display thread shows, so the rest of this file does not care which method made them.
+///
+/// (hookshot fork) Its depth, motion and camera are FSR 3.1's (vk_fsr3_inputs.h), made at the gameplay upscale's dispatch
+/// whatever upscales: the depth reversed (1 at the near plane, so DepthInverted is true and is what it says), the camera's
+/// motion without the jitter, and the planes and the field of view from the projection the scene was drawn with.
+int dlssg_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_t uh, int m, const fsr3_inputs::Frame* scene) {
+    if (!scene) return 0;
+    const fsr3_inputs::Frame& f = *scene;
+    const int want = std::min(m - 1, (int)dlssg::frames_wanted());
+    if (want <= 0) return 0;
+
+    dlssg::Inputs in;
+    in.color = fg.frames[cur].view;
+    in.color_image = fg.frames[cur].image;
+    in.color_format = VK_FORMAT_R8G8B8A8_UNORM;   // (ensure_size, for fg.frames)
+    in.width = uw, in.height = uh;
+    in.depth = f.depth, in.depth_image = f.depth_image, in.depth_format = VK_FORMAT_R32_SFLOAT;
+    in.motion = f.motion, in.motion_image = f.motion_image, in.motion_format = VK_FORMAT_R16G16_SFLOAT;
+    in.render_width = f.width, in.render_height = f.height;
+    in.motion_scale[0] = 1.0f, in.motion_scale[1] = 1.0f;   // (already render pixels)
+    in.jitter[0] = f.jitter[0], in.jitter[1] = f.jitter[1];
+    in.depth_inverted = true;   // (vk_fsr3_inputs.cpp's copy: reversed)
+    // The colour here is the window's R8G8B8A8, which is not HDR whatever the scene was resolved in.
+    in.colour_hdr = false;
+    in.aspect = uh ? (float)uw / (float)uh : 16.0f / 9.0f;
+    in.near_plane = f.camera.near_plane;
+    in.far_plane = f.camera.far_plane;
+    in.fov_y = f.camera.fov_y;
+    in.reset = f.reset;
+    // The rest of the matrix set NGX wants, from the scene's own (without the jitter). The camera's own position and axes
+    // come out of the view: its 3x3 is world -> camera, so the rows are the camera's axes in world space and the position
+    // is -R transpose times the translation.
+    float view[16];
+    if (f.have_previous && scene_view(f, view) && invert4x4(f.projection, in.clip_to_camera_view)) {
+        memcpy(in.camera_view_to_clip, f.projection, sizeof in.camera_view_to_clip);
+        for (int i = 0; i < 16; i++) in.clip_to_lens_clip[i] = (i % 5) == 0 ? 1.0f : 0.0f;
+        for (int c = 0; c < 3; c++) {
+            in.camera_right[c] = view[0 * 4 + c];
+            in.camera_up[c] = view[1 * 4 + c];
+            in.camera_forward[c] = view[2 * 4 + c];
+            in.camera_pos[c] = -(view[0 * 4 + c] * view[0 * 4 + 3] + view[1 * 4 + c] * view[1 * 4 + 3] +
+                                 view[2 * 4 + c] * view[2 * 4 + 3]);
+        }
+        // (clip -> previous clip, and back: the pair the motion was made with, vk_fsr3_inputs.cpp)
+        in.have_matrices = dlss_math::reprojection(f.view_projection, f.previous_view_projection, in.clip_to_prev_clip) &&
+                           dlss_math::reprojection(f.previous_view_projection, f.view_projection, in.prev_clip_to_clip);
+    }
+    if (!in.have_matrices) return 0;   // (the first frame after a cut has no pair to interpolate on)
+    in.frames_made = (uint32_t)want;
+    int made = 0;
+    for (int k = 1; k <= want; k++) {
+        in.frame_index = (uint32_t)k;
+        if (!dlssg::generate(cmd, in)) break;
+        const VkImage from = dlssg::made_image((uint32_t)k);
+        if (!from) break;
+        const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {uw, uh, 1}};
+        vkCmdCopyImage(cmd, from, VK_IMAGE_LAYOUT_GENERAL, set.frame[k - 1].image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        made++;
+    }
+    if (made != want) {
+        static int told = 0;
+        if (told++ < 4)
+            logf("vk: dlssg made %d of %d frames: the renderer's own interpolation takes this one",
+                 made, want);
+        return 0;   // (a half-made set would show one real frame and one stale image)
+    }
+    return made;
+}
+
+/// (hookshot fork) AMD FSR 4's frame generation through AMD's runtime (gpu/vk/vk_ffx.h), between DLSS frame generation and
+/// FSR 3.1's: FSR 3.1's inputs (vk_fsr3_inputs.h) handed over as images, and every made frame in one dispatch. A refusal
+/// returns 0, which leaves the set to the next method in the chain.
+int ffx_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32_t uh, int m, const fsr3_inputs::Frame* scene) {
+    if (!scene) return 0;
+    const fsr3_inputs::Frame& f = *scene;
+    const int want = std::min(m - 1, (int)ffx::frames_wanted());
+    if (want <= 0) return 0;
+    ffx::FrameInputs in;
+    in.color = fg.frames[cur].image;
+    in.color_format = VK_FORMAT_R8G8B8A8_UNORM;   // (ensure_size, for fg.frames)
+    in.width = uw, in.height = uh;
+    in.depth = f.depth_image, in.depth_format = VK_FORMAT_R32_SFLOAT;
+    in.motion = f.motion_image, in.motion_format = VK_FORMAT_R16G16_SFLOAT;
+    in.render_width = f.width, in.render_height = f.height;
+    in.motion_scale[0] = 1.0f, in.motion_scale[1] = 1.0f;   // (already render pixels)
+    in.jitter[0] = f.jitter[0], in.jitter[1] = f.jitter[1];
+    in.near_plane = f.camera.near_plane, in.far_plane = f.camera.far_plane, in.fov_y = f.camera.fov_y;
+    in.frame_time_ms = f.frame_ms;
+    in.have_view = scene_view(f, in.view);
+    in.reset = f.reset;
+    in.frames = (uint32_t)want;
+    if (!ffx::generate(cmd, in)) return 0;
+    for (int k = 1; k <= want; k++) {
+        const VkImage from = ffx::made_image((uint32_t)k);
+        if (!from) return 0;   // (a half-made set would show one real frame and one stale image)
+        const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+                            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {uw, uh, 1}};
+        vkCmdCopyImage(cmd, from, VK_IMAGE_LAYOUT_GENERAL, set.frame[k - 1].image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
+    static std::atomic<int> said{0};
+    if (said++ == 0) logf("vk: amd fsr 4 frame generation: %d made frames a frame at %ux%u", want, uw, uh);
+    return want;
+}
+
+/// (hookshot fork) The Frame generation method in effect (framegen_methods.h): the row's, or RX_VK_FG_METHOD=<0-4> over it
+/// for a run, of what runs here (available: framegen_methods.h bit of each). Read every time: the row changes while the
+/// game runs
+int framegen_method(unsigned& available) {
+    namespace fgm = framegen_methods;
+    static const int env_method = getenv("RX_VK_FG_METHOD") ? atoi(getenv("RX_VK_FG_METHOD")) : -1;
+    const int chosen = env_method >= 0 ? env_method : opts.framegen_method;
+    available = fgm::always();
+    if (dlssg::supported()) available |= fgm::bit(fgm::DLSS);
+    // (super build) AMD FSR 4 / FSR 3.1 frame generation are retired: they did not run reliably in play, where DLSS
+    // frame generation and the built-in blend do. A saved FSR choice reads as Auto.
+    return fgm::effective(chosen, available);
+}
+
+/// (hookshot fork) framegen_record's last answer, for framegen_scene_inputs_wanted: the draws ask it, on their own threads,
+/// and the methods' own checks (NGX's among them) are asked on the present's only
+std::atomic<bool> scene_inputs_asked{false};
+
+bool framegen_scene_inputs_wanted() {
+    return opts.framegen >= 2 && framegen_on() && scene_inputs_asked.load(std::memory_order_relaxed);
 }
 
 bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4]) {
@@ -743,6 +942,15 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     const bool blend = fg.have_prev && !gap;
     static uint64_t sequence = 0;
     sequence++;
+    // (hookshot fork) A gap is a loading screen or a cut, and the renderer's own interpolator already refuses to blend
+    // across one. The vendor methods with a history of their own are told as well (FSR 3.1's sees the gap in the sequence
+    // too), and so is the camera motion of the open neural rendering backend (vk_camera_motion.h)
+    if (gap) {
+        camera_motion::reset();
+        dlssg::reset();
+        ffx::reset();
+        fsr3fi::reset();
+    }
     const uint32_t uw = (uint32_t)w, uh = (uint32_t)h;
     const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
     full_barrier(cmd);
@@ -792,9 +1000,35 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         fg.recorded_at = now;
         return true;
     }
-    // (hookshot) At 2x, AMD FSR 3.1's frame interpolation where it runs; it makes the midpoint only, so 3x and more (and Auto,
-    // above) stay with the interpolation below, as does any present it does not take
-    if (blend && m == 2 && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence);
+    // (hookshot) The Frame generation method row (framegen_methods.h), for 2x to 8x: Auto tries each vendor method best
+    // first (DLSS frame generation, FSR 4, FSR 3.1, each with the scene's own depth and motion: vk_fsr3_inputs.h), one
+    // chosen outright is tried alone, and where none makes the set the renderer's own interpolation below does, exactly as
+    // before. FSR 3.1's makes the midpoint only, so it makes 2x sets only (framegen_methods.h makes_set): at 3x and above
+    // it is passed over. Frame generation's Auto (above: a frame for each of the display's refreshes, at its own time) is
+    // the renderer's own. Read every frame, so a change in the menu reaches the next one
+    namespace fgm = framegen_methods;
+    unsigned avail = 0;
+    const int method = framegen_method(avail);
+    scene_inputs_asked.store(fgm::first(method, avail, m) != fgm::BUILTIN, std::memory_order_relaxed);
+    {
+        static int said = -1;
+        if (blend && m > 1 && said != method) {
+            said = method;
+            logf("vk: frame generation method: %s (chosen %d, available mask %#x)",
+                 method == fgm::AUTO ? "auto" : method == fgm::DLSS ? "NVIDIA DLSS" : method == fgm::FSR4 ? "AMD FSR 4"
+                 : method == fgm::FSR3 ? "AMD FSR 3.1" : "built-in", opts.framegen_method, avail);
+        }
+    }
+    // (the scene's inputs for this present, taken once for every method: a present never uses another frame's)
+    fsr3_inputs::Frame scene_frame;
+    const fsr3_inputs::Frame* scene = blend && m > 1 && fsr3_inputs::take(scene_frame) ? &scene_frame : nullptr;
+    const auto tried = [&](int which) {
+        return set->made == 0 && blend && m > 1 && fgm::tries(method, which) && (avail & fgm::bit(which)) &&
+               fgm::makes_set(which, m);
+    };
+    if (tried(fgm::DLSS)) set->made = dlssg_frames(cmd, *set, cur, uw, uh, m, scene);
+    if (tried(fgm::FSR4)) set->made = ffx_frames(cmd, *set, cur, uw, uh, m, scene);
+    if (tried(fgm::FSR3) && fsr3fi::frames_wanted()) set->made = fsr3fi_frame(cmd, *set, cur, uw, uh, sequence, scene);
     if (set->made == 0 && blend && m > 1) {
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
                             {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);

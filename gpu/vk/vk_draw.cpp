@@ -1023,6 +1023,8 @@ __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGr
     }
 }
 __declspec(noinline) VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
+    static const bool trace = getenv("RX_VK_TRACE_KEYS") != nullptr;   // (super build: which compute pipeline the driver is on)
+    if (trace) logf("vk: trace: compute pipeline of module %p", (void*)ci->stage.module);
     __try {
         return vkCreateComputePipelines(dev.device, cache, 1, ci, nullptr, pl);
     } __except (1) {
@@ -3735,6 +3737,54 @@ struct IndexBind {
 thread_local IndexBind last_ib;
 int64_t st_desc_reused;
 
+/// (hookshot) The last depth target the game bound with a colour target, kept for an upscaler that
+/// has to derive motion from it. Ocarina hands its own upscaler no depth at all
+/// (docs/upscaling.md), so the scene's own depth buffer is the only one there is. Written where the
+/// targets are resolved, which is once per NOP_SET_RT rather than per draw.
+struct SceneDepth {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0, height = 0;
+    uint64_t frame = 0;   // (the present it was seen in: the largest of each frame, never one from long ago)
+};
+SceneDepth scene_depth;
+// (scene_depth and scene_vp: written where targets are resolved, which RX_VK_PARALLEL's workers do too, and read by the
+// present path's neural rendering, scene_frame_inputs)
+std::mutex scene_mu;
+
+
+
+/// (hookshot) Once per distinct render target set, with RX_VK_MRT_CENSUS=1: how many colour attachments the game
+/// binds at once, their formats and the extent. Off by default and free while off.
+///
+/// This is here to answer one question with evidence instead of assumption. A denoising upscaler -- NVIDIA's DLSS
+/// Ray Reconstruction, AMD's FSR Ray Regeneration -- does not take colour, motion and depth; it takes a ray-traced
+/// renderer's guide buffers, which means albedo, normals, roughness and specular hit distance. A deferred renderer
+/// writes those as several colour attachments of one extent in one pass. So if this game never binds more than one
+/// colour attachment, it has no G-buffer, there are no guides to hand such an upscaler, and the question is closed;
+/// if it binds three or four at one extent, there may be. docs/upscaling.md records what the census found.
+static void mrt_census(const Targets& at) {
+    static const bool on = getenv("RX_VK_MRT_CENSUS") != nullptr;
+    if (!on) return;
+    uint64_t key = (uint64_t)at.n | ((uint64_t)at.width << 8) | ((uint64_t)at.height << 32);
+    for (int i = 0; i < at.n && i < 8; i++) key = key * 1000003ull + (uint64_t)at.color_format[i];
+    key = key * 1000003ull + (at.depth ? (uint64_t)at.depth_format + 1 : 0);
+    static std::mutex mu;
+    static std::unordered_set<uint64_t> seen;
+    {
+        std::lock_guard lk(mu);
+        if (seen.size() >= 512 || !seen.insert(key).second) return;
+    }
+    char line[400];
+    int k = snprintf(line, sizeof line, "vk: targets %d colour %ux%u:", at.n, at.width, at.height);
+    for (int i = 0; i < at.n && i < 8 && k < 340; i++)
+        k += snprintf(line + k, sizeof line - k, " %u", (unsigned)at.color_format[i]);
+    if (at.n == 0 && k < 340) k += snprintf(line + k, sizeof line - k, " (none)");
+    if (at.depth && k < 340) k += snprintf(line + k, sizeof line - k, ", depth %u", (unsigned)at.depth_format);
+    logf("%s", line);
+}
+
 thread_local uint64_t targets_serial = ~0ull;   // (the state's render targets resolved once per NOP_SET_RT)
 thread_local Targets cached_targets;
 
@@ -3788,6 +3838,17 @@ Targets targets(NvnState& s) {
                 if (!at.n) at.samples = tex->samples;
             }
         }
+    }
+    mrt_census(at);
+    // (the scene's depth, for an upscaler's reprojection: the largest one of this frame, so a shadow map or a quarter-
+    // resolution effect pass does not displace the one the scene was drawn with. Per frame, not the largest ever: after the
+    // render resolution drops, or the texture cache drops that image, an old one would be handed on, destroyed)
+    if (at.depth && at.depth_view && at.n >= 1) {
+        const uint64_t now = texture_frame_no();
+        std::lock_guard sk(scene_mu);
+        if (scene_depth.frame != now ||
+            (uint64_t)at.width * at.height >= (uint64_t)scene_depth.width * scene_depth.height)
+            scene_depth = {at.depth->image, at.depth_view, at.depth_format, at.width, at.height, now};
     }
     targets_serial = s.rt_serial;
     cached_targets = at;
@@ -5906,6 +5967,81 @@ void bind_index(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkInd
     last_ib = {b, (uint64_t)offset, (uint32_t)type, true};
 }
 
+/// (hookshot) The view projection a scene draw read, composed from the two matrices its uniform
+/// buffer carries. RX_VK_VP_HUNT found the layout and docs/upscaling.md records it: 192 bytes at
+/// stage 5 slot 0, a 3x4 row-major view at +0 (its last row implied 0,0,0,1), the 4x4 projection at
+/// +48, and the viewport with its reciprocals at +112.
+///
+/// Taken from the draw rather than from a game object, because this is the matrix the depth was
+/// actually rendered with, which is what a reprojection needs. Read through ub_read, so it is the
+/// submitted uniform data and not live guest memory.
+struct SceneViewProjection {
+    float m[16]{};      ///< row major, projection times view
+    /// The two halves, kept as well as their product: frame generation is handed the projection and
+    /// its inverse separately (NGX's cameraViewToClip / clipToCameraView), and the camera's own
+    /// position and axes come out of the view. Deriving them back out of the product would mean
+    /// factorizing it, which is worse than keeping what we already had.
+    float view[16]{};   ///< row major, world -> camera (the game's 3x4, with 0,0,0,1 under it)
+    float proj[16]{};   ///< row major, camera -> clip
+    bool have = false;
+};
+SceneViewProjection scene_vp;
+
+/// Recognizes the buffer by its own contents rather than by a program key: the projection's m11 is
+/// 1/tan(fovy/2) and its last row makes w = -z. A buffer that does not look like that is left alone.
+static void capture_view_projection(const NvnState& s) {
+    // Once per render target set, not once per draw. Called from draw() it ran 1106 times a frame
+    // and walked every stage and slot reading uniforms each time, which stuttered hard on a real
+    // display. The serial changes when the targets do, so the matrix still refreshes every frame.
+    static thread_local uint64_t done_for = ~0ull;
+    if (done_for == targets_serial) return;
+    // Looked at once per target set whether or not a matrix is found. Setting this only on success
+    // was the bug: most target sets -- shadow, UI, post -- hold no projection, so the guard never
+    // armed for them and the scan below ran on every draw of them instead. At 1800 draws a frame
+    // that was 30,000 reads of guest memory a frame, each one copying the 4 KB page it landed in
+    // out of the capture, and it cost the frame about 300 ms. It is what made a 57-60 fps scene run
+    // at 3, with FSR off as much as on, and it is why the frame-rate collapse looked like FSR's.
+    done_for = targets_serial;
+    for (int stage = 0; stage < kNvnStages; stage++) {
+        for (int slot = 0; slot < 16; slot++) {
+            const nvn_p_bind_buf& u = s.ubo[stage][slot];
+            if (!u.addr || u.size < 112) continue;
+            float f[28];
+            if (!ub_read(u.addr, f, sizeof f)) continue;
+            // (the projection at +48: f[12..27]. m11 = f[17], and f[26] = -1 with f[27] = 0 is w = -z)
+            if (!(f[17] > 0.5f && f[17] < 20.0f) || f[26] > -0.5f || f[27] != 0.0f) continue;
+            if (f[13] != 0.0f || f[14] != 0.0f || f[16] != 0.0f) continue;   // (a clean projection)
+            const float* v = f;          // the 3x4 view
+            const float* pr = f + 12;    // the 4x4 projection
+            float vp[16];
+            for (int r = 0; r < 4; r++) {
+                for (int c = 0; c < 4; c++) {
+                    float sum = 0;
+                    for (int k = 0; k < 4; k++) {
+                        // (the view's implied fourth row is 0,0,0,1)
+                        const float vk = k < 3 ? v[k * 4 + c] : (c == 3 ? 1.0f : 0.0f);
+                        sum += pr[r * 4 + k] * vk;
+                    }
+                    vp[r * 4 + c] = sum;
+                }
+            }
+            std::lock_guard sk(scene_mu);
+            memcpy(scene_vp.m, vp, sizeof vp);
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 4; c++) scene_vp.view[r * 4 + c] = v[r * 4 + c];
+            scene_vp.view[12] = scene_vp.view[13] = scene_vp.view[14] = 0.0f;
+            scene_vp.view[15] = 1.0f;
+            memcpy(scene_vp.proj, pr, sizeof scene_vp.proj);
+            scene_vp.have = true;
+            static std::atomic<int> told{0};
+            if (told++ == 0)
+                logf("vk: the scene's view projection: stage %d slot %d, view at +0 and projection "
+                     "at +48 (m11 %.3f)", stage, slot, (double)f[17]);
+            return;
+        }
+    }
+}
+
 /// (hookshot, a diagnostic for the temporal upscaler's motion: vk_temporal.cpp) RX_VK_DLSS_TRACE=<frames>: every that many frames, one frame's
 /// draws into targets of a size the upscaler can take as the scene (temporal_scene_size), logged: the program, its targets' formats, the geometry and the uniform buffers
 static void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
@@ -5951,6 +6087,27 @@ static void skin_check(const NvnState& s, const Program& p, const DrawArgs& d, c
         !temporal_wanted())
         return;
     const auto attr = [&](int i) { return *reinterpret_cast<const nvn_va_st*>(&s.vattr[i]); };
+    {   // (super build, RX_VK_DLSS_SKIN_CENSUS=1: the scene's indexed draws by vertex layout, once each, 96 at most: which
+        // ones actor motion takes and which it leaves to the camera's motion)
+        static const bool census = getenv("RX_VK_DLSS_SKIN_CENSUS") != nullptr;
+        if (census) {
+            static std::mutex mu;
+            static std::unordered_set<uint64_t> seen;
+            uint64_t key = mix(p.key, (uint64_t)s.nvattr << 32 | (uint32_t)s.ubo[0][3].size);
+            char line[512];
+            int n = snprintf(line, sizeof line, "vk: skin census: program %016llx, ubo3 %llu bytes, ubo1 %llu, stride %u, %d attributes:",
+                             (unsigned long long)p.key, (unsigned long long)s.ubo[0][3].size, (unsigned long long)s.ubo[0][1].size,
+                             s.vstream[0].stride, s.nvattr);
+            for (int i = 0; i < s.nvattr && i < 10 && n < 480; i++) {
+                const nvn_va_st a = attr(i);
+                key = mix(key, (uint64_t)a.fmt << 16 | a.stream);
+                n += snprintf(line + n, sizeof line - n, " %d:%#x@%u/s%u", i, a.fmt, a.offset, a.stream);
+            }
+            std::lock_guard lk(mu);
+            if (seen.size() < 96 && seen.insert(key).second) logf("%s", line);
+        }
+    }
+    if (s.nvattr < 7) return;
     const nvn_va_st pos = attr(0);
     if ((pos.fmt != NVN_FORMAT_RGB32F && pos.fmt != NVN_FORMAT_RGBA16F) || pos.stream != 0) return;
     const nvn_p_bind_buf& bones = s.ubo[0][3];
@@ -5959,6 +6116,27 @@ static void skin_check(const NvnState& s, const Program& p, const DrawArgs& d, c
     k.formats = pos.fmt == NVN_FORMAT_RGBA16F ? dlss_actor::kHalfPosition : 0;
     for (int set = 0; set < 2 && 6 + set < s.nvattr; set++) {
         const nvn_va_st w = attr(4 + set), j = attr(6 + set);
+        // (super build) a second set of one influence: an R8 weight and an R8UI or R16UI joint (Link's draws: a fifth bone,
+        // his cap's among them; left out, those vertices were skinned with part of their weight and their motion was wrong)
+        if (set == 1 && w.fmt == NVN_FORMAT_R8 && (j.fmt == NVN_FORMAT_R8UI || j.fmt == NVN_FORMAT_R16UI) && !w.stream && !j.stream) {
+            k.formats |= dlss_actor::kSingle << set;
+            if (j.fmt == NVN_FORMAT_R8UI) k.formats |= dlss_actor::kByteJoints << set;
+            k.weights[set] = w.offset, k.joints[set] = j.offset, k.sets = set + 1;
+            break;
+        }
+        // (super build) a rigid model on one bone: a joint and no weight (Navi's body, props, held items: a palette of one
+        // matrix, sometimes more); and two-bone skinning, RG8 weights with RG8UI joints (Navi's wings among them)
+        if (set == 0 && !w.fmt && (j.fmt == NVN_FORMAT_R8UI || j.fmt == NVN_FORMAT_R16UI) && !j.stream) {
+            k.formats |= (dlss_actor::kSingle | dlss_actor::kNoWeight) << set;
+            if (j.fmt == NVN_FORMAT_R8UI) k.formats |= dlss_actor::kByteJoints << set;
+            k.weights[set] = 0, k.joints[set] = j.offset, k.sets = set + 1;
+            break;
+        }
+        if (w.fmt == NVN_FORMAT_RG8 && j.fmt == NVN_FORMAT_RG8UI && !w.stream && !j.stream) {
+            k.formats |= (dlss_actor::kPair | dlss_actor::kByteJoints) << set;
+            k.weights[set] = w.offset, k.joints[set] = j.offset, k.sets = set + 1;
+            continue;
+        }
         if (w.fmt != NVN_FORMAT_RGBA8 || (j.fmt != NVN_FORMAT_RGBA16UI && j.fmt != NVN_FORMAT_RGBA8UI) || w.stream || j.stream ||
             w.offset % 4 || j.offset % 4)
             break;
@@ -6091,6 +6269,7 @@ void mask_stabilize(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t 
 }
 
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    capture_view_projection(s);
     PROF_HOT(PROF_DRAW);
     FINE_N(FC_DRAWS, 1);
     stats_tick();
@@ -7004,6 +7183,29 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     (void)in_h, (void)out_h;
     return true;
 }
+
+/// (hookshot) The scene's depth and matrix, for the present path (vk_draw.h).
+bool scene_frame_inputs(SceneFrameInputs* out) {
+    if (!out) return false;
+    std::lock_guard sk(scene_mu);
+    // (this frame's or the last one's: a depth not seen since may be gone from the texture cache)
+    if (!scene_depth.view || !scene_depth.image || !scene_depth.width || !scene_depth.height ||
+        texture_frame_no() - scene_depth.frame > 1)
+        return false;
+    out->depth_image = scene_depth.image;
+    out->depth_view = scene_depth.view;
+    out->depth_format = scene_depth.format;
+    out->render_width = scene_depth.width;
+    out->render_height = scene_depth.height;
+    out->have_view_projection = scene_vp.have;
+    if (scene_vp.have) {
+        memcpy(out->view_projection, scene_vp.m, sizeof out->view_projection);
+        memcpy(out->view, scene_vp.view, sizeof out->view);
+        memcpy(out->projection, scene_vp.proj, sizeof out->projection);
+    }
+    return true;
+}
+
 
 /// (hookshot) OoT's gameplay TAAU network (fd029a317a9a4b94) stood in for: its input upscaled into its output
 /// (shaders/taau_upscale.comp). The network's translation loses the blue channel, the yellow cast over every

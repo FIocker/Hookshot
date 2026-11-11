@@ -52,6 +52,10 @@ void sync_preset_budgets(int) {}
 bool row_fixed(const int*) { return false; }
 int upscaler() { return 0; }
 unsigned upscalers_available() { return 1; }
+/* (the Frame generation method row's stepping, which set_row calls: the real rules, Auto and Built-in here) */
+/* FRAMEGEN_METHODS */
+namespace framegen_methods = mkwvk::framegen_methods;
+unsigned framegen_available() { return framegen_methods::always(); }
 namespace ur {
 int snap(int, int value) { return value; }
 int snap_render(int, int value) { return value; }   // (the slider)
@@ -131,6 +135,7 @@ def fixture(source):
         "/* FPS_CAP_ROW */": block(menu, fps_cap.start()),
         "/* PRESET */": definition(menu, "void apply_preset"),
         "/* SET_ROW */": definition(menu, "void set_row"),
+        "/* FRAMEGEN_METHODS */": (ROOT / "gpu" / "vk" / "framegen_methods.h").read_text(encoding="utf-8").replace("#pragma once", ""),
         "/* FRAMEGEN_ROW */": block(menu, menu.index('{TAB_GRAPHICS, "Frame generation"')),
         "/* QUALITY_ROW */": block(menu, menu.index('{TAB_GRAPHICS, "Quality preset"')),
     }

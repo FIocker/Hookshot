@@ -36,10 +36,18 @@ struct Frame {
     bool reset = false;                     ///< no history: the first frame, a new size, or a gap of more than two frames
     float frame_ms = 16.667f;               ///< since the frame before's
     uint64_t frame = 0;                     ///< texture_frame_no() when prepared
+    // (hookshot fork) For AMD FSR 4 (vk_ffx.h) and NVIDIA DLSS frame generation (vk_dlssg.h), which are handed whole
+    // images and the camera's matrices: the images of the three views above (R16G16B16A16_SFLOAT, R32_SFLOAT and
+    // R16G16_SFLOAT), and this frame's and the frame before's view-projection and this frame's projection, row major and
+    // without their jitter (have_previous: false on a reset, when there is no frame before)
+    VkImage color_image = VK_NULL_HANDLE, depth_image = VK_NULL_HANDLE, motion_image = VK_NULL_HANDLE;
+    float view_projection[16]{}, previous_view_projection[16]{}, projection[16]{};
+    bool have_previous = false;
 };
 
 /// FSR 3.1 is asked for at all: its upscaler (the Upscaler row) or its frame interpolation (the Frame generation row). The
-/// scene's camera is kept only then
+/// scene's camera is kept only then. (hookshot fork: or FSR 4's upscaler, or another frame generation method that takes
+/// these inputs: vk_framegen.h framegen_scene_inputs_wanted)
 bool wanted();
 
 /// A draw into a scene-sized target with the vertex stage's uniform buffer 3 at `camera`: what vk_temporal.cpp's
@@ -60,10 +68,10 @@ bool prepare(VkCommandBuffer cmd, Texture* in, VkImageView in_view, Frame& out);
 /// (or it is older than the frame before), so a present never interpolates with another frame's depth and motion
 bool take(Frame& out);
 
-/// FSR 3.1's upscaler drew this frame, rw x rh into dw x dh: the host's jitter follows FSR (jitter_size)
+/// FSR 3.1's upscaler (or FSR 4's) drew this frame, rw x rh into dw x dh: the host's jitter follows FSR (jitter_size)
 void upscaled(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh);
 
-/// The scene's width (axis 0) or height (1) for the host's camera jitter while FSR 3.1's upscaler draws, 0 otherwise or
+/// The scene's width (axis 0) or height (1) for the host's camera jitter while FSR 3.1's upscaler (or FSR 4's) draws, 0 otherwise or
 /// with RX_VK_FSR_JITTER=0; axis 2: the jitter sequence's length (dlss_jitter_phases). vk_replay.cpp's rx_option gives
 /// the host this or vk_temporal.cpp's temporal_jitter_size, whichever upscaler draws
 uint32_t jitter_size(int axis);

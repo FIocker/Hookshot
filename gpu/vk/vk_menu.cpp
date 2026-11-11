@@ -35,6 +35,13 @@
 #include "vk_progress.h"   // (StartupView, version_text: the start-up screen)
 #include "vk_ui.h"
 #include "vk_menu_keys.h"   // (which gamepad buttons confirm and go back: those A and B are bound to)         // (how it looks: Dear ImGui, vk_imgui.h)
+
+#include "vk_dlssnr.h"   // (whether this build can offer DLSS 5 neural rendering at all)
+#include "vk_streamline.h"   // (nr_why: why neural rendering is not available here)
+#include "vk_dlssnr_ngx.h"   // (nr::why, nr::built: whichever backend the Backend row runs)
+#include "vk_ffx.h"      // (and FSR 4, AMD's runtime)
+#include "vk_dlssg.h"    // (the Frame generation method row: whether DLSS frame generation runs here)
+#include "framegen_methods.h"
 #include "vk_dlss.h"
 #include "../../host/hos_wide_size.h"   // (the widescreen picture's size, as host/hos_main.c works it out)
 #include "vk_fsr3.h"      // (the Upscaler row: whether AMD FSR 3.1 runs on this GPU)
@@ -62,7 +69,10 @@ enum MenuTab {
     TAB_GAMEPLAY = 2,
     TAB_CONTROLS = 3,
     TAB_DEBUG = 4,   // (the OoT debug tools of #785, a tab of their own)
-    TAB_COUNT = 5,
+    // (hookshot fork) DLSS 5 neural rendering's own tab. Its rows are the model's own knobs, which belong together and would
+    // have doubled the Graphics tab on their own.
+    TAB_NEURAL = 5,
+    TAB_COUNT = 6,
     TAB_MOTION = TAB_COUNT,   // (hookshot: not a tab of the strip, the Motion page that the Controls tab's Motion row
                               // opens: one past the strip's tabs, so a tab added before TAB_COUNT moves it along)
     TAB_PAGE = TAB_MOTION + 1   // (hookshot: the Controls page's rows, above its grid; no tab shows them)
@@ -142,6 +152,46 @@ const char* tx_upscale(int v) {
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];   // (a setting past the row: the label, not the next bytes)
     return t[v];
 }
+// (hookshot) DLSS 5 neural rendering's rows. The model names are the quality modes DLSS-NR takes
+// (an sl::DLSSMode: performance, balanced, quality, DLAA). The three styles are the plugin's own and
+// these are its names for them; the presets are DLSS presets A to G, where Default lets the plugin
+// pick -- which is 0, not 1: a preset of 1 silently pins A. A style or preset this plugin does not
+// have is refused by Streamline, which turns the row back rather than the feature off
+// (vk_dlssnr.cpp).
+const char* tx_nr_model(int v) {
+    static const char* t[] = {"Performance", "Balanced", "Quality", "DLAA"};
+    return t[std::min(std::max(v, 0), 3)];
+}
+const char* tx_nr_style(int v) {
+    static const char* t[] = {"Default", "Natural", "Cinematic"};
+    return t[std::min(std::max(v, 0), 2)];
+}
+// (hookshot) Which path NVIDIA's model is reached by (vk_dlssnr_ngx.h): the same model and the same rows either way.
+const char* tx_nr_backend(int v) {
+    static const char* t[] = {"Auto", "Streamline", "NGX direct", "Open (OpenDLSS-NR)"};
+    return t[std::min(std::max(v, 0), 3)];
+}
+// (super build) Where in the frame the model runs (opts.nr_stage, vk_dlss.cpp): on the upscaler's picture, or on the
+// render-size scene before the upscaler takes it
+const char* tx_nr_stage(int v) {
+    static const char* t[] = {"After upscaler", "Before upscaler"};
+    return t[std::min(std::max(v, 0), 1)];
+}
+const char* hn_nr_backend(int v, int variant) {
+    static char b[96];
+    if (variant >= 0) return variant == 0 ? "Auto: running through OpenDLSS-NR, the open network." : nullptr;   // (the longest)
+    if (v != nr::AUTO) return nullptr;
+    const int r = nr::running_backend();
+    snprintf(b, sizeof b, "Auto: running through %s.", r == nr::NGX ? "NGX directly" : r == nr::OPEN ? "OpenDLSS-NR, the open network"
+                                                                                       : "Streamline");
+    return b;
+}
+const char* tx_nr_preset(int v) {
+    static char b[16];
+    if (v <= 0) return "Default";
+    snprintf(b, sizeof b, "Preset %c", 'A' + (v - 1));
+    return b;
+}
 /// The Window scaling filter row's value: its filter, or that none is needed (the saved value stays, for another window size)
 const char* tx_filter(int v) { return filter_needed() ? tx_upscale(v) : "Not needed (window = output)"; }
 const char* tx_reflex(int v) {
@@ -167,10 +217,13 @@ namespace ur = upscaler_rows;
 /// One bit per upscaler that runs here (upscaler_rows.h bit). Each backend caches its own answer, so this costs nothing
 unsigned upscalers_available() {
     return ur::bit(ur::GAME) | ur::bit(ur::OFF) | ur::dlss_bits(dlss_why() == DLSS_OK) |
-           (fsr3::supported() ? ur::bit(ur::FSR3) : 0u) | ur::fsr4_bits(fsr4_why() == FSR_OK);
+           (fsr3::supported() ? ur::bit(ur::FSR3) : 0u) | ur::fsr4_bits(fsr4_why() == FSR_OK) |
+           (ffx::upscale_supported() ? ur::bit(ur::FSR4) : 0u);   // (super build: FSR 4 through AMD's FidelityFX runtime, vk_ffx.cpp)
 }
 /// (FSR 3.1 has inputs of its own; DLSS and FSR 4 run on the frame chain they share, temporal_mode; Off is neither)
-int upscaler() { return fsr3_wanted() ? (int)ur::FSR3 : temporal_off() ? (int)ur::OFF : temporal_mode(); }
+int upscaler() {
+    return fsr3_wanted() ? (int)ur::FSR3 : fsr4_wanted() ? (int)ur::FSR4 : temporal_off() ? (int)ur::OFF : temporal_mode();
+}
 const char* tx_upscaler(int) {
     static const char* t[ur::kUpscalers] = {"Game's own", "NVIDIA DLSS", "NVIDIA DLAA", "AMD FSR 3.1", "AMD FSR 4",
                                             "AMD FSR 4 Native AA", "Off (no upscaling)"};
@@ -261,6 +314,17 @@ const char* hn_dlss_model(int v, int variant) {
     if (variant == 1) return unused;
     if (variant == 2) return env;
     return variant == 0 ? t[std::clamp(v, 0, ur::kModels - 1)] : nullptr;
+}
+/// Neural rendering: the value, or why it is not available here (vk_streamline.cpp explain_refusal; the log has more)
+const char* hn_nr(int v, int variant) {
+    static const char* const t[] = {"Off.", "On: NVIDIA's model goes over every finished frame."};
+    static const char* const longest =
+        "Not available: NVIDIA's model is RTX 50 only. RTX 20-40: a patched nvngx_dlssnr.dll (readme).";
+    if (variant < 0) {
+        const char* w = nr::why();
+        return *w ? w : t[std::clamp(v, 0, 1)];
+    }
+    return variant == 0 ? t[std::clamp(v, 0, 1)] : variant == 1 ? longest : nullptr;
 }
 const char* tx_percent(int v) {
     static char b[8];
@@ -613,10 +677,16 @@ MENU_HINTS(hn_preset, 0, "Each row as you set it. Changing most rows yourself co
            "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 40%.",
            "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 50%.")
 MENU_HINTS(hn_gpu, 0, "The best dedicated GPU.")
+unsigned framegen_available();
 /// Frame generation: how many frames are made for each of the game's
 const char* hn_framegen(int v, int variant) {
-    // (2x: by AMD FSR 3.1 where it runs, from the scene's depth and motion: vk_framegen.cpp. Variant 1 is that text)
-    if (v == 2 && (variant < 0 ? fsr3fi::frames_wanted() != 0 : variant == 1))
+    // (2x: by AMD FSR 3.1 where it runs, from the scene's depth and motion: vk_framegen.cpp. Variant 1 is that text.
+    // hookshot fork: where FSR 3.1 is the method that makes the frame, framegen_methods.h first)
+    namespace fgm = framegen_methods;
+    if (v == 2 && (variant < 0 ? fsr3fi::frames_wanted() != 0 &&
+                                     fgm::first(fgm::effective(opts.framegen_method, framegen_available()),
+                                                framegen_available(), 2) == fgm::FSR3
+                               : variant == 1))
         return "One made frame between each two of the game's, by AMD FSR 3.1 from the scene's depth and motion.";
     if (variant > 0) return nullptr;
     if (v <= 0) return "Only the game's own frames: no added delay.";
@@ -625,6 +695,33 @@ const char* hn_framegen(int v, int variant) {
     snprintf(b[v], sizeof b[v], "%s between each two of the game's.", v == 2 ? "One made frame" : v == 3 ? "Two made frames" : v == 4 ? "Three made frames"
              : v == 5 ? "Four made frames" : v == 6 ? "Five made frames" : v == 7 ? "Six made frames" : "Seven made frames");
     return b[std::clamp(v, 2, 8)];
+}
+// (hookshot) The Frame generation method (opts.framegen_method): what makes the frames, of what runs here (framegen_methods.h)
+namespace fgm = framegen_methods;
+/// One bit per method that runs here. Each backend caches its own answer
+unsigned framegen_available() {
+    unsigned m = fgm::always();
+    if (dlssg::supported()) m |= fgm::bit(fgm::DLSS);
+    // (super build) AMD FSR 4 / FSR 3.1 frame generation are retired: they did not run reliably in play, where DLSS
+    // frame generation and the built-in blend do. A saved FSR choice reads as Auto.
+    return m;
+}
+const char* tx_framegen_method(int v) {
+    static const char* t[] = {"Auto", "NVIDIA DLSS", "AMD FSR 4", "AMD FSR 3.1", "Built-in"};
+    return t[fgm::effective(v, framegen_available())];
+}
+const char* hn_framegen_method(int v, int variant) {
+    static const char* const t[] = {
+        "The best that runs here: DLSS, then FSR 4, then FSR 3.1, then the built-in blend. The log says which.",
+        "NVIDIA's network, from the game's depth and motion: RTX 40 and 50, with nvngx_dlssg.dll in the game's ngx folder.",
+        "AMD's FSR 4 frame generation, through AMD's runtime beside the game: Windows.",
+        "AMD's FSR 3.1 frame generation, built from AMD's open shaders: any GPU. At 2x only (it makes the frame halfway "
+        "between two of the game's): at 3x and above the built-in blend makes them.",
+        "The renderer's own blend of the two frames around it: every GPU, the least sharp.",
+    };
+    if (variant < 0) v = fgm::effective(v, framegen_available());
+    else if (variant > 0) return nullptr;
+    return t[std::clamp(v, 0, fgm::kMethods - 1)];
 }
 MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stutter, at up to one frame of delay.")
 const char* tx_vsync(int v) {
@@ -722,6 +819,9 @@ Row rows[] = {
     {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
      "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion or camera cuts can "
      "show artifacts.", hn_framegen, false, true},
+    {TAB_GRAPHICS, "Frame generation method", &opts.framegen_method, 0, framegen_methods::kMethods - 1, 1,
+     tx_framegen_method, "What makes the frames at 2x to 8x, of the methods that run on this PC (Frame generation's Auto is the "
+     "built-in blend). A method that cannot make a frame leaves it to the built-in blend.", hn_framegen_method, false, true},
     {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, "When each frame is shown.", hn_pace},
     {TAB_GRAPHICS, "V-Sync", &opts.vsync, 0, 2, 1, tx_vsync,
      "Whether a frame waits for the display's refresh before it is shown. Changes at once.", hn_vsync, false, true},
@@ -897,6 +997,51 @@ Row rows[] = {
      "cancels."},
     {TAB_GAMEPLAY, "Quit", nullptr, 0, 0, 0, nullptr,
      "Save your progress first. Press Enter or A twice to quit. Esc or B cancels."},
+
+    // Neural rendering (11 rows). Every row here takes effect on the next frame: the backend reads
+    // them live rather than caching them at start-up, which is the bug that made the upscaling rows
+    // look dead for a whole release (docs/upscaling.md).
+    {TAB_NEURAL, "Neural rendering", &opts.nr, 0, 1, 1, tx_onoff,
+     "DLSS 5 neural rendering: NVIDIA's model goes over the finished frame and rebuilds detail, tone and structure in it. "
+     "Needs an NVIDIA RTX card and NVIDIA's model file, or, through Open, an NVIDIA RTX 40/50 or AMD RX 7000/9000 card and a model "
+     "folder you supply (readme.md; Backend says how it is reached); the rows below are the model's own settings and do nothing "
+     "while this is Off.", hn_nr},
+    {TAB_NEURAL, "Backend", &opts.nr_backend, 0, 3, 1, tx_nr_backend,
+     "What runs the model. Streamline and NGX direct are NVIDIA's runtime; Open is OpenDLSS-NR, an open Vulkan network "
+     "for NVIDIA and AMD cards that reads a model folder you supply (nr-model in the game folder). Auto takes Streamline, "
+     "then NGX direct, then Open where a model folder is there, and Open on a card that is not NVIDIA's. The rows below "
+     "apply to whichever runs (readme.md).", hn_nr_backend},
+    {TAB_NEURAL, "Stage", &opts.nr_stage, 0, 1, 1, tx_nr_stage,
+     "Where the model runs. After upscaler: on the upscaled picture, before the HUD, the sharpest result. Before upscaler: on "
+     "the scene at its render size, which the upscaler (DLSS, DLAA or FSR 3.1 on DLSS's inputs) then takes up to the window's: "
+     "much cheaper, the model working on a fraction of the pixels, a little softer. Needs NGX direct or Open; with any other "
+     "upscaler it runs after, as before."},
+    {TAB_NEURAL, "Model", &opts.nr_model, 0, 3, 1, tx_nr_model,
+     "How much work the model does per frame: Performance is the cheapest, DLAA the most expensive, Quality the model's "
+     "own default. Streamline 2.14's plugin ignores this one -- it is sent correctly and a later NVIDIA release is "
+     "expected to act on it."},
+    {TAB_NEURAL, "Style", &opts.nr_style, 0, 2, 1, tx_nr_style,
+     "Which look the model aims for. Natural keeps close to what the game drew; Cinematic is the stronger, graded look. "
+     "A style this version of the plugin does not have is refused and the row goes back."},
+    {TAB_NEURAL, "Preset", &opts.nr_preset, 0, 7, 1, tx_nr_preset,
+     "Which trained network the model uses, as DLSS presets A to G. Default lets the plugin pick, which is usually the "
+     "newest it has."},
+    {TAB_NEURAL, "Intensity", &opts.nr_intensity, 0, 100, 10, tx_percent,
+     "How much of the model's result is mixed into the frame. 0% leaves the picture as the game drew it; 100% is the "
+     "model's full effect."},
+    {TAB_NEURAL, "Local tone", &opts.nr_local_tone, 0, 100, 10, tx_percent,
+     "How far the model may move brightness and colour within a small area. Lower keeps the game's own shading."},
+    {TAB_NEURAL, "Local structure", &opts.nr_local_structure, 0, 100, 10, tx_percent,
+     "How much fine detail the model adds back -- texture, edges, small shapes. Too much looks etched."},
+    {TAB_NEURAL, "Global tone", &opts.nr_global_tone, 0, 100, 10, tx_percent,
+     "How far the model may move the whole frame's brightness and contrast. Like Model, Streamline 2.14's plugin ignores "
+     "this and a later one is expected to use it."},
+    {TAB_NEURAL, "Skin structure", &opts.nr_skin, 0, 100, 10, tx_percent,
+     "How much detail the model adds to faces and skin, separately from everything else. It only does anything with Auto "
+     "mask on, which is how the model knows which pixels are a character."},
+    {TAB_NEURAL, "Auto mask", &opts.nr_auto_mask, 0, 1, 1, tx_onoff,
+     "Lets the model find the characters in the frame by itself, which is what Skin structure needs. Also helps it leave "
+     "the HUD and text alone, which it has no reason to rebuild."},
 };
 constexpr int kQuitRow = sizeof rows / sizeof rows[0] - 1;
 constexpr int kRestartRow = kQuitRow - 1;
@@ -1172,8 +1317,12 @@ const char* ini_key(const Row& r) {
     if (r.value == &opts.dlss) return "dlss";   // (as opts.dlss and RX_VK_DLSS)
     if (r.value == &opts.handheld) return "handheld_profile";   // (the Profile row; host/nn_applet.c reads it at the start)
     if (r.value == &opts.mesh_mode) return "mesh_shaders";   // (gpu/vk/vk_main.cpp reads it as the device is made)
-    static char k[32];
+    static char k[40];
     size_t n = 0;
+    // (hookshot) the Neural tab's rows (Backend, Model, Style, Preset, ...) are the model's knobs, saved as nr_<name>: their names
+    // alone say nothing in the file and would clash with a later row's. The switch itself, Neural rendering, keeps its own
+    if (r.tab == TAB_NEURAL && strncmp(r.name, "Neural", 6) != 0)
+        for (const char* p = "nr_"; *p; p++) k[n++] = *p;
     for (const char* p = r.name; *p && n + 1 < sizeof k; p++) k[n++] = *p == ' ' ? '_' : (char)tolower(*p);
     k[n] = 0;
     return k;
@@ -1316,6 +1465,8 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     // (the scaling rows: only what can run here; the Render resolution row through the Upscaler's own steps)
     // (the Upscaler by engine; the Render resolution's Native is the engine's full-size form: upscaler_rows.h)
     if (r.value == &opts.dlss) v = ur::step_engine(upscaler(), dir, upscalers_available());
+    if (r.value == &opts.framegen_method)   // (hookshot: only the methods that run here)
+        v = framegen_methods::step(framegen_methods::effective(*r.value, framegen_available()), dir, framegen_available());
     if (r.value == &opts.resolution) {
         int up = upscaler(), res = *r.value;
         ur::step_render(upscaler(), *r.value, dir, &up, &res);
@@ -1851,7 +2002,7 @@ void draw_options(ui::Ctx& c) {
     ui::banner(c, hh);
     // the tabs in the banner: dark ink on the tan, the shown one light on a dark inset; the tab keys at their ends (a click there
     // is the previous or the next tab)
-    const char* const tab_titles[TAB_COUNT] = {"Graphics", "Audio", "Gameplay", "Controls", "Debug"};
+    const char* const tab_titles[TAB_COUNT] = {"Graphics", "Audio", "Gameplay", "Controls", "Debug", "Neural"};
     float tw[TAB_COUNT], total = 0;
     for (int i = 0; i < TAB_COUNT; i++) tw[i] = ui::size_of(c.f.heading, 23 * s, tab_titles[i]).x + 56 * s, total += tw[i];
     float x = (c.w - total) * 0.5f;
@@ -2576,6 +2727,17 @@ void menu_init() {
     if (done) return;
     done = true;
     for (auto& count : item_counts) count.store(-1, std::memory_order_relaxed);
+    // (hookshot) DLSS 5 neural rendering: its rows are the model's own and none of them can do
+    // anything in a build with neither Streamline's headers (Windows) nor an NGX SDK (either
+    // platform: vk_dlssnr_ngx.h). The switch is left in place and says why, because a missing tab
+    // is a bug report and a tab that explains itself is not.
+    if (!nr::built())
+        for (Row& r : rows)
+            if (r.value == &opts.nr) {
+                r.hi = 0;
+                r.help = "DLSS 5 neural rendering is not offered by this build. It needs NVIDIA's NGX SDK, or on "
+                         "Windows NVIDIA Streamline's headers, at build time (readme.md says how to build with them).";
+            }
     bool has_options = false;
     const char* cheats = getenv("HOS_OOT_CHEATS");
     cheats_env = cheats && !strcmp(cheats, "1");
