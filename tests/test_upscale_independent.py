@@ -42,6 +42,7 @@ def main():
     functions = (block(source, "struct ScaleState") + " scale;\n" + block(source, "struct WideSides") + ";\nstd::atomic<WideSides> wide_now;\n" +
                  block(source, "bool init_scale(") + "\n" +
                  block(source, "bool framegen_wanted(") + "\n" + block(source, "bool framegen_on(") + "\n" +
+                 block(source, "int window_sharpness(") + "\n" +
                  block(scale_source, "VkImage framegen_scale("))
     template = (ROOT / "tests/upscale_independent_test.cpp").read_text(encoding="utf-8")
     assert template.count("// PRODUCTION_FUNCTIONS") == 1

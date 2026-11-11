@@ -39,6 +39,8 @@
 #include "vk_paths.h"   // (game_module_path: the frame trace beside the game)
 #include "vk_gprof.h"
 #include "vk_framegen.h"
+#include "vk_dlssnr.h"
+#include "vk_dlssnr_ngx.h"   // (nr::apply: whichever neural rendering backend runs)
 #include "vk_menu.h"
 #include "vk_jobs.h"
 #include "vk_shader.h"
@@ -1584,6 +1586,16 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     if (++timed % 240 == 0) {
         logf("vk: parallel replay, a command buffer: dry pass %.2f ms, segments %.2f ms (%.1f of them), lock taken %.0f "
              "times, waited for %.2f ms (all threads)", dry_ms / 240, seg_ms / 240, segs_n / 240, locks_n / 240, wait_ms / 240);
+        par_sites_report();
+        {   // (hookshot) why the two busiest sites had to take it, which is what decides the fix
+            int64_t w = 0, cm = 0, mi = 0, tu = 0, te = 0, tun = 0;
+            memory_pool_lock_reasons(&w, &cm, &mi);
+            texture_touch_misses(&tu, &te, &tun);
+            logf("vk:   pool lock: %lld written, %lld cache miss, %lld mirror; texture touch: %lld upload, "
+                 "%lld epoch, %lld not uploaded (per command buffer)",
+                 (long long)(w / 240), (long long)(cm / 240), (long long)(mi / 240), (long long)(tu / 240),
+                 (long long)(te / 240), (long long)(tun / 240));
+        }
         dry_ms = seg_ms = segs_n = wait_ms = locks_n = 0;
     }
     // what follows, after them all (the uniform updates are written to guest memory at the submission's end)
@@ -2985,7 +2997,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         // A2B10G10R10); that picture goes to the HDR10 swapchain as it is, not through the SDR-to-HDR pass)
         present_native_pq.store(tex && dev.hdr && opts.hdr == 2 && tex->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32,
                                 std::memory_order_relaxed);
-        if (tex && !dev.offscreen && (opts.upscale || opts.sharpness || dev.hdr || wide_sides_possible())) {   // (and ultrawide's menu sides)
+        if (tex && !dev.offscreen && (window_filter() || opts.sharpness || dev.hdr || wide_sides_possible())) {   // (and ultrawide's menu sides)
             // Keep the sampled view with the same cached image as the direct present, before advancing its age.
             direct_view = texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample);
             tex->last_frame = texture_frame_no();
@@ -3025,6 +3037,12 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         dump_present(presents);
         if (src && (dev.offscreen || shots) && offscreen_init()) {
             if (dev.offscreen) {
+                // (hookshot) Neural rendering here too, as present_image does it: with no window (HOS_HEADLESS) present_image
+                // is never reached, and a headless run is how a backend is driven into a scene and measured. The same call and
+                // guard as there: whichever backend runs (nr::apply), and not where the chain already ran it (dlss_nr_before_hud)
+                VkImageView nr_view = VK_NULL_HANDLE;
+                if (!dlss_nr_before_hud())
+                    if (const VkImage nr = nr::apply(r.cmd, src, sw, sh, &nr_view)) src = nr;
                 image_barrier(r.cmd, off_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 blit_crop(r.cmd, src, sw, sh, crop, off_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                           dev.swap_extent.width, dev.swap_extent.height);
@@ -3571,6 +3589,14 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     if (vkBeginCommandBuffer(f.cmd, &bi) == VK_ERROR_DEVICE_LOST) device_lost();
     VkImage dst = dev.swap_images[index];
     full_barrier(f.cmd);   // (after the game's work for the frame: earlier submits on this queue)
+    // (hookshot) DLSS 5 neural rendering, over the frame as the game finished it and before anything
+    // of ours is drawn on top: the model gets the picture, not the menu or the FPS counter, which it
+    // has no reason to rebuild. It gives back an image of its own and the game's is left untouched;
+    // a frame it could not do returns null and goes to the window exactly as it always did.
+    if (src && !dlss_nr_before_hud()) {   // (super build: not where it already ran before the HUD, vk_dlss.cpp)
+        VkImageView nr_view = VK_NULL_HANDLE;
+        if (const VkImage up = nr::apply(f.cmd, src, sw, sh, &nr_view)) src = up, view = nr_view;   // (Streamline or NGX direct: vk_dlssnr_ngx.h)
+    }
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     const PresentAspect aspect{src && host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
     const PresentRect rect = present_rect(sw, sh, crop, dev.swap_extent.width, dev.swap_extent.height, aspect);
@@ -3631,7 +3657,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         sample.host_aspect(src && host && host->aspect_ratio, aspect.ratio);
         sample.kind = src ? std::min(present_kind.load(), 1u) : 2;
         sample.route = trace_route;
-        sample.filter = opts.upscale;
+        sample.filter = window_filter();
         sample.sharpness = opts.sharpness;
         sample.framegen = opts.framegen;
         const PresentTraceDecision decision = trace.note(sample);
@@ -3649,6 +3675,8 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
             logf("vk: present geometry: limit of %u changes reached; further geometry messages suppressed", PresentGeometryTrace::kLimit);
         }
     }
+    // (super build) Streamline frame generation: a game frame's depth, motion and camera tagged for Streamline's present, which
+    // makes the frame between it and the one before
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height);   // (hookshot) Dear ImGui's overlays, over all of it
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     if (vkEndCommandBuffer(f.cmd) == VK_ERROR_DEVICE_LOST) device_lost();
@@ -4316,6 +4344,39 @@ void fill_replay_table(MkwVkRenderer& t) {
 
 std::atomic<bool> par_active{false};
 std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
+
+/// (hookshot) Per-site lock counts, for the report below. A plain array under the same mutex the
+/// caller already holds: this is only reached while the lock is taken, so it needs no lock of its
+/// own, and parallel replay is off by default so it costs nothing in a normal run.
+struct ParSite {
+    const char* file = nullptr;
+    int line = 0;
+    int64_t taken = 0, waited_ns = 0;
+};
+ParSite par_sites[64];
+void par_lock_seen(const char* file, int line, int64_t waited_ns) {
+    for (ParSite& s : par_sites) {
+        if (s.file == nullptr) { s.file = file, s.line = line; }
+        else if (s.file != file || s.line != line) continue;
+        s.taken++, s.waited_ns += waited_ns;
+        return;
+    }
+}
+
+/// The sites that took it most since the last report, worst first.
+void par_sites_report() {
+    ParSite* order[64];
+    int n = 0;
+    for (ParSite& s : par_sites)
+        if (s.file && s.taken) order[n++] = &s;
+    std::sort(order, order + n, [](const ParSite* a, const ParSite* b) { return a->taken > b->taken; });
+    for (int i = 0; i < n && i < 6; i++) {
+        const char* slash = strrchr(order[i]->file, '/');
+        logf("vk:   lock %s:%d taken %lld times, waited %.2f ms", slash ? slash + 1 : order[i]->file,
+             order[i]->line, (long long)order[i]->taken, order[i]->waited_ns / 1e6);
+    }
+    for (ParSite& s : par_sites) s.taken = 0, s.waited_ns = 0;
+}
 std::recursive_mutex& par_mutex() {
     return par_mu;
 }

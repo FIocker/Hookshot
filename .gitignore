@@ -35,5 +35,7 @@ __pycache__/
 build-linux/
 *.so
 
+# NVIDIA's Streamline SDK, fetched at build time and never committed (docs/neural-rendering.md)
+/streamline-sdk/
 # ---- NVIDIA's DLSS SDK (scripts/ngx_sdk.py): NVIDIA's files, never committed ----
 ngx-sdk/

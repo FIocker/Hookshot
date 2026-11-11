@@ -23,7 +23,7 @@ def main():
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("tree_headers", "flag_text", "object_key")]
     def assigned(n, names):
         return isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names for t in n.targets)
-    inputs = [n for n in ast.walk(tree) if assigned(n, ("ngx_flags", "ngx_deps", "vdeps"))]
+    inputs = [n for n in ast.walk(tree) if assigned(n, ("ngx_flags", "ngx_deps", "ngx_files", "vdeps"))]
     loops = [n for n in ast.walk(tree) if isinstance(n, ast.For) and isinstance(n.target, ast.Name) and n.target.id == "src"
              and isinstance(n.iter, ast.Call) and isinstance(n.iter.func, ast.Name) and n.iter.func.id == "vk_sources"]
     assert len(functions) == 3 and len(loops) == 1, "actual dependency/key functions and Vulkan producer loop are required"

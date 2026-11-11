@@ -112,6 +112,10 @@ Texture* texture_touch(Texture* tex, bool for_sampling);
 /// texture_touch without the lock where it has nothing more to do (its contents up to date for this submission):
 /// false when the full texture_touch is needed
 bool texture_touch_quick(Texture* tex, bool for_sampling);
+/// (diagnostics) Why that quick path last gave up, and reset: an upload still in flight, a texture
+/// not uploaded at all, or one simply not checked yet this epoch. The last is once per texture per
+/// epoch and inherent; the other two are not.
+void texture_touch_misses(int64_t* upload, int64_t* epoch, int64_t* unuploaded);
 /// Whether texture_written and texture_rendered would change nothing this frame (a parallel replay: no lock then)
 bool texture_marked(const Texture* tex);
 /// The parallel replay's segment this thread records (its order in the submission; uploads and mirror syncs a later

@@ -48,6 +48,7 @@ std::atomic<bool> fsr4_on{false};
 namespace ur { enum { GAME=0, DLSS=1, FSR4=4 }; bool is_fsr4(int mode) { return mode==FSR4; } }
 int temporal_mode() { return fsr4_on ? ur::FSR4 : dlss_on ? ur::DLSS : ur::GAME; }
 bool fsr3_wanted() { return fsr_on.load(); }
+bool fsr4_wanted() { return false; }   // (FSR 4 through AMD's FidelityFX runtime, vk_ffx.cpp: not here)
 
 namespace gpu {
 struct State {

@@ -106,6 +106,45 @@ def check_vk_symbols(so):
     print("  namespace scope, not inside an anonymous namespace")
     return False
 
+def streamline_sdk_path():
+    """(hookshot) NVIDIA Streamline's public headers, for DLSS 5 neural rendering, or None.
+
+    DLSS-NR is not an NGX feature a program can create for itself: the only way in is Streamline's
+    sl.dlss_nr plugin, reached through sl.interposer.dll at run time. Only Streamline's headers are
+    compiled in -- they are MIT-licensed, and none of them is in this repository (CONTRIBUTING.md):
+    RX_VK_STREAMLINE_SDK names the builder's own copy, failing that a `streamline-sdk` folder
+    beside the repository or in the work folder.
+
+    Windows only, and that is Streamline's limit rather than ours: the interposer and every sl.*
+    plugin ship as DLLs and the headers pull in <windows.h>. A player on Linux gets DLSS-NR by
+    running the Windows build under Proton, which is where it was measured.
+    """
+    named = os.environ.get("RX_VK_STREAMLINE_SDK")
+    root = os.path.normpath(os.path.join(kit.HERE, ".."))
+    places = [named] if named else [os.path.join(root, "streamline-sdk"),
+                                    os.path.join(os.path.dirname(root), "streamline-sdk"),
+                                    os.path.join(os.environ.get("OOT_WORK", ""), "streamline-sdk")]
+    for d in places:
+        if d and os.path.isfile(os.path.join(d, "include", "sl.h")):
+            return d
+    if named:
+        print("RX_VK_STREAMLINE_SDK=%s has no include/sl.h; DLSS 5 neural rendering is left out" % named)
+    return None
+
+
+def streamline_link():
+    """(hookshot) What a Windows build with Streamline's headers links for the interposer check.
+
+    Nothing of Streamline's and nothing of NVIDIA's: sl.interposer.dll is loaded at run time. These
+    two are Windows' own, and they are what gpu/vk/vk_streamline.cpp's signed_by_nvidia calls --
+    WinVerifyTrust from wintrust and the certificate walk from crypt32. A build without Streamline's
+    headers does not compile that function and links neither.
+    """
+    if LINUX or not streamline_sdk_path():
+        return []
+    return ["-lwintrust", "-lcrypt32", "-ladvapi32"]   # (advapi32: the NGX signature override, read for the log)
+
+
 def target():
     """toolchain.native_target(), with the sysroot on Linux"""
     return toolchain.native_target() + (["--sysroot=" + SYSROOT] if LINUX and SYSROOT else [])
@@ -228,6 +267,35 @@ def vk_sources():
     vc = os.path.join(GPU, "third_party", "suyu", "video_core")
     out += [os.path.join(vc, "textures", f) for f in ("decoders.cpp", "astc.cpp")]   # (the WebGPU back end's unswizzle)
     return sorted(out)
+
+
+def opennr_jobs(cxx, vk, gen_dir, obj_dir, vflags, vdeps):
+    """(hookshot) Open neural rendering (gpu/vk/vk_opennr.h): OpenDLSS-NR's host sources and the adapter around them,
+    as deliberate jobs rather than through vk_sources(). Upstream's files are compiled from a copy in gen_dir with the
+    portability patches of scripts/opennr_kernels.py (third_party stays upstream's, byte for byte); its PTX kernels are
+    generated there from its Python generators and embedded as gen_dir/opennr_ptx.h. Returns the jobs, the bytes
+    vk_opennr.cpp depends on (the PTX header) and the PTX kernel count; ([], b"", 0) without the vendored folder."""
+    root = os.path.join(kit.HERE, "..")
+    adapter = os.path.join(vk, "opennr")
+    if not os.path.isdir(os.path.join(root, "third_party", "opendlss-nr", "src")) or not os.path.isdir(adapter):
+        return [], b"", 0
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("opennr_kernels", os.path.join(root, "scripts", "opennr_kernels.py"))
+    kernels = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kernels)
+    src = str(kernels.prepare_sources(os.path.join(gen_dir, "opendlss-nr", "src")))
+    ptx = os.path.join(gen_dir, "opennr-ptx")
+    kernels.generate_ptx(ptx)
+    header = os.path.join(gen_dir, "opennr_ptx.h")
+    count = kernels.write_ptx_header(ptx, header)
+    # (upstream's <volk.h> is the shim in gpu/vk/opennr, so it goes first; VK_NV_cuda_kernel_launch is a beta extension)
+    flags = vflags + ["-DVK_ENABLE_BETA_EXTENSIONS", "-I" + adapter, "-I" + src]
+    deps = vdeps + tree_headers(src)
+    jobs = [(cxx, os.path.join(src, f), os.path.join(obj_dir, "vk_opennr_upstream_" + f[:-4] + ".o"), flags, deps)
+            for f in kernels.RENDERER_SOURCES]
+    jobs += [(cxx, os.path.join(adapter, f), os.path.join(obj_dir, "vk_opennr_" + f[:-4] + ".o"), flags, deps)
+             for f in sorted(os.listdir(adapter)) if f.endswith(".cpp")]
+    return jobs, open(header, "rb").read(), count
 
 
 def cpm_dirs():
@@ -910,12 +978,32 @@ def main():
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
+        # (hookshot) Say what this back end is being built with: "is DLSS actually in this release?"
+        # has been asked of a build three times and guessed at twice, and the answer belongs in the
+        # build log and so in CI's.
+        #
+        # Inside this branch, deliberately. It was put just above it, as its own `if`, to keep it
+        # out of the region tests/test_shader_stamp_cache.py execs -- and that made it the head of
+        # this if/elif chain, so the whole Vulkan build was skipped and a Windows run reported
+        # "compiled in 0s" and produced no DLL. Two printed lines are not worth a branch.
+        print("vk: DLSS (NGX): %s" % (("compiled in, from " + NGX_SDK) if NGX_SDK
+                                      else "left out (no HOOKSHOT_NGX_SDK; see readme.md)"))
+        print("vk: DLSS 5 neural rendering (Streamline): %s"
+              % (("compiled in, from " + streamline_sdk_path())
+                 if (not LINUX and streamline_sdk_path())
+                 else ("left out: Windows only" if LINUX else
+                       "left out (no Streamline headers found; see readme.md)")))
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
             "-include", "string", "-include", "vector",
             "-std=c++20", "-O2", "-g0", "-DNDEBUG", "-Wno-everything", "-DVK_NO_PROTOTYPES", "-DMKWVK_BUILDING",
             *(["-DHOOKSHOT_RELEASE"] if os.environ.get("RX_RELEASE") == "1" else []),   # (the shaders precompiled before the game)
+            # (hookshot) RX_VK_STREAMLINE_SDK=<path to Streamline> compiles DLSS 5 neural rendering
+            # against Streamline's MIT-licensed headers. Nothing is linked: sl.interposer.dll is
+            # loaded from the player's own PC at run time. Windows only (streamline_sdk_path).
+            *((["-DRX_VK_STREAMLINE=1", "-I" + os.path.join(streamline_sdk_path(), "include")])
+              if (not LINUX and streamline_sdk_path()) else []),
             # (Eden's recompiler before suyu's root: suyu has its own shader_recompiler/ headers, and a Shader::Info
             # of the other layout in some objects is what crashed the descriptor walk. MKWVK_INCLUDES changes the
             # object keys, which leave the include folders out, when this order changes)
@@ -929,6 +1017,9 @@ def main():
         # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
         # it is the stubs that say DLSS is not there)
         ngx_flags = ["-DHOOKSHOT_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
+        # (hookshot) the files that see NVIDIA's headers: DLSS super resolution, and DLSS frame generation and DLSS 5 neural
+        # rendering over the same NGX session (vk_ngx.cpp, vk_dlssg.cpp, vk_dlssnr_ngx.cpp)
+        ngx_files = ("vk_dlss.cpp", "vk_ngx.cpp", "vk_dlssg.cpp", "vk_dlssnr_ngx.cpp")
         ngx_deps = tree_headers(os.path.join(NGX_SDK, "include")) if NGX_SDK else b""
         if NGX_SDK:
             print("the Vulkan back end: with NVIDIA DLSS (NVIDIA's NGX SDK in %s)" % NGX_SDK, flush=True)
@@ -943,6 +1034,9 @@ def main():
                                    os.path.join(GPU, "compat"))
         vdeps = tree_headers(vk, os.path.join(GPU, "render"), os.path.join(GPU, "compat"),
                              os.path.join(GPU, "third_party", "suyu", "video_core", "textures"))
+        opennr, opennr_ptx, opennr_count = opennr_jobs(cxx, vk, gen_dir, obj_dir, vflags, vdeps)
+        print("vk: open neural rendering (OpenDLSS-NR): %s" % (("compiled in, %d PTX kernels" % opennr_count) if opennr
+                                                               else "left out (no third_party/opendlss-nr)"))
         # (hookshot) Dear ImGui (third_party/imgui) draws the overlays over the window's image (gpu/vk/vk_imgui.cpp; vk_menu.cpp
         # draws with it). Its objects see only its own headers; its headers are a dependency of the two files that include them
         imgui = os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "imgui"))
@@ -974,12 +1068,14 @@ def main():
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
                             vflags + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
                             ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []) +
-                            (ngx_flags if os.path.basename(src) == "vk_dlss.cpp" else []) +
+                            (ngx_flags if os.path.basename(src) in ngx_files else []) +
                             (imgui_flags if os.path.basename(src) in imgui_users else []) +
                             (fsr_flags if os.path.basename(src) == "vk_fsr4.cpp" else []),
                             vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_imgui.cpp" else b"") +
-                            (ngx_deps if os.path.basename(src) == "vk_dlss.cpp" else b"") +
-                            (imgui_deps if os.path.basename(src) in imgui_users else b"")))
+                            (ngx_deps if os.path.basename(src) in ngx_files else b"") +
+                            (imgui_deps if os.path.basename(src) in imgui_users else b"") +
+                            (opennr_ptx if os.path.basename(src) == "vk_opennr.cpp" else b"")))
+        vk_jobs += opennr
         if NGX_SDK and not LINUX and toolchain.mingw():
             # (llvm-mingw: NVIDIA's static library was built with Microsoft's compiler for its static runtime (/MT). What it asks
             # of that runtime: the C parts as for the static FFmpeg (host/mingw_msvc_shims.c), the C++ ones in vk_ngx_msvc_rt.cpp)
@@ -1144,7 +1240,7 @@ def main():
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
-                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
+                ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-lgdi32"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw()) + streamline_link()
         r = subprocess.run(link, capture_output=True, text=True)
         if r.returncode:
             undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})

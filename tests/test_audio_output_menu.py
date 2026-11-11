@@ -41,6 +41,7 @@ static int device_channels, device_asked;
 static int au_device_channels(void) { device_asked++; return device_channels; }
 HOST
 struct Row { int tab; const char* name; int* value; };
+enum { TAB_NEURAL = 5 };   // (the fork's Neural tab: ini_key saves its rows as nr_<name>)
 struct { int output_res, vsync, resolution, fps_cap, upscale, dlss, handheld, mesh_mode, audio_output; } opts;
 MENU
 int main(int argc, char **argv) {
