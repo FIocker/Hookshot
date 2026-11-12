@@ -40,6 +40,7 @@ static void au_unlock(void) {}
 static int device_channels, device_asked;
 static int au_device_channels(void) { device_asked++; return device_channels; }
 HOST
+enum { TAB_NEURAL = 5 };   // (the Neural tab: ini_key saves its rows as nr_<name>)
 struct Row { int tab; const char* name; int* value; };
 struct { int output_res, vsync, resolution, fps_cap, upscale, dlss, handheld, mesh_mode, ultrawide, audio_output; } opts;   // (ultrawide: the Aspect ratio row's key)
 MENU

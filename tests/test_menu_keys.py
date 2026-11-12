@@ -196,6 +196,7 @@ static std::string mic_want;
 static std::string mic_key(const char* name) { return name; }
 static void mic_tell_host() {}
 static int rumble_step(int v) { return v; }
+enum { TAB_NEURAL = 5 };   // (the Neural tab: ini_key saves its rows as nr_<name>)
 struct Row { int tab; const char* name; int* value; int lo, hi; };
 // INI_KEY
 static Row rows[] = {{0, "Menu shortcut", &opts.menu_shortcut, 0, 2}};

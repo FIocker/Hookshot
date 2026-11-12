@@ -56,6 +56,7 @@
 #include "temporal_jitter.h"
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
+#include "vk_dlssnr_ngx.h"   // (DLSS 5 neural rendering before the upscaler or before the HUD, nr::apply)
 #include "vk_draw.h"
 #include "fsr3_math.h"   // (hookshot: FSR 3.1's depth constants from the projection)
 #include "vk_fsr3.h"   // (fsr3_wanted: AMD FSR 3.1 upscales with inputs of its own; fsr3_engine: on this chain)
@@ -111,6 +112,26 @@ int temporal_mode() {
 bool temporal_wanted() { return temporal_mode() != ur::GAME; }
 bool temporal_off() { return opts.dlss == ur::OFF && temporal_mode() == ur::GAME; }
 bool temporal_full_scale() { return ur::full_scale(temporal_mode()); }
+
+// (hookshot) The frame (texture_frame_no) DLSS 5 neural rendering last ran in the chain, on the engine's picture before the HUD
+// or on the scene before the upscaler: the present's own pass is left out while it does
+std::atomic<uint64_t> nr_before_hud_at{0};
+namespace {
+/// Whether neural rendering is asked to run before the upscaler: the Neural tab's Stage row (opts.nr_stage), RX_VK_DLSS_NR_STAGE=
+/// before or after over it, with the row on
+bool nr_pre_upscale_asked() {
+    static const char* env = getenv("RX_VK_DLSS_NR_STAGE");
+    const bool before = env && *env ? !strcmp(env, "before") : opts.nr_stage == 1;
+    return before && nr::built() && nr_settings().on;
+}
+}  // namespace
+bool dlss_nr_before_hud() {
+    const uint64_t at = nr_before_hud_at.load(std::memory_order_relaxed);
+    // (before the upscaler, the present's own pass stays out for a while after the last frame the model ran there, not two
+    // frames: a pause menu or a cut without the engine's upscale would otherwise make the model's feature again at the
+    // window's size, and again at the render size after, a hitch each way)
+    return at && texture_frame_no() - at <= (nr_pre_upscale_asked() ? 600u : 2u);
+}
 
 namespace {
 
@@ -170,6 +191,7 @@ struct State {
     int reason_repeats = 0;
     const TemporalEngine* told_first = nullptr;
     bool told_camera = false;
+    bool told_nr_pre = false;   // (neural rendering before the upscaler, logged once)
     // (actor motion: the skinned draws into the scene since the last upscale; the poses the engine last drew, by draw: the
     // frame before's, where they were copied to in one of the two pose buffers (each frame's poses go to the other one))
     struct Skin {
@@ -1026,6 +1048,36 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         prep();
         full_barrier(cmd);
     }
+    // (hookshot) DLSS 5 neural rendering before the upscaler (the Neural tab's Stage row): the model goes over the scene at its
+    // render size, which the engine then takes up to the output. Its cost goes with its pixels: at Quality's 67% under half of
+    // them (measured on an RTX card at 4168x1976, DLSS Quality: 47 fps against 37 after the upscaler). The colour here is the
+    // engine's input as the prep made it, so the model sees the picture's light as the engine will; its result goes back into
+    // the engine's colour input. It gets the scene's own depth, motion, jitter and the chain's resets (NrFrame): told there was
+    // none, a model that keeps history would average away the jitter the engine needs and ghost on camera motion
+    bool nr_pre = false;
+    if (nr_pre_upscale_asked()) {
+        NrFrame scene;
+        scene.depth = s.depth.image, scene.depth_view = s.depth.view;
+        scene.motion = s.motion.image, scene.motion_view = s.motion.view;
+        dlss_math::jitter_to_pixels(cam.jitter, rw, rh, scene.jitter);
+        scene.depth_reversed = fsr_flip;
+        scene.reset = reset;
+        VkImageView nr_view = VK_NULL_HANDLE;
+        const VkImage nr_image = nr::apply(cmd, s.color.image, rw, rh, &nr_view, &scene);
+        if (nr_image) {
+            VkImageBlit bl{};
+            bl.srcSubresource = bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            bl.srcOffsets[1] = bl.dstOffsets[1] = {(int32_t)rw, (int32_t)rh, 1};
+            vkCmdBlitImage(cmd, nr_image, VK_IMAGE_LAYOUT_GENERAL, s.color.image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
+            full_barrier(cmd);
+            nr_pre = true;
+            nr_before_hud_at.store(texture_frame_no(), std::memory_order_relaxed);
+            if (!s.told_nr_pre) {
+                s.told_nr_pre = true;
+                logf("vk: DLSS 5 neural rendering runs before the upscaler, on the %ux%u scene", rw, rh);
+            }
+        }
+    }
     TemporalFrame f;
     f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
     f.render_w = rw, f.render_h = rh;
@@ -1051,9 +1103,22 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         return false;   // (the network writes its output over whatever the evaluation did)
     }
     full_barrier(cmd);
+    // (hookshot) DLSS 5 neural rendering here, on the engine's picture before the game draws its HUD over it, rather than at the
+    // present over the finished frame: the model never sees the hearts, the map or the text (over the finished frame it left a
+    // dark smudge behind them). Not where it already ran before the upscaler. RX_VK_DLSS_NR_STAGE=present: at the present
+    VkImageView picture = s.output.view;
+    if (!nr_pre && nr::built() && nr_settings().on) {
+        static const bool at_present = getenv("RX_VK_DLSS_NR_STAGE") && !strcmp(getenv("RX_VK_DLSS_NR_STAGE"), "present");
+        VkImageView nr_view = VK_NULL_HANDLE;
+        if (!at_present && nr::apply(cmd, s.output.image, dw, dh, &nr_view) && nr_view) {
+            picture = nr_view;
+            nr_before_hud_at.store(texture_frame_no(), std::memory_order_relaxed);
+            full_barrier(cmd);
+        }
+    }
     {
         const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
-        const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},
+        const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, picture, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
         VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
         w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;

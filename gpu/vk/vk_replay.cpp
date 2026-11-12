@@ -39,6 +39,7 @@
 #include "vk_paths.h"   // (game_module_path: the frame trace beside the game)
 #include "vk_gprof.h"
 #include "vk_framegen.h"
+#include "vk_dlssnr_ngx.h"   // (nr::apply: DLSS 5 neural rendering at the present, for frames the chain did not make)
 #include "vk_dlss.h"   // (hookshot: dlss_fg_idle)
 #include "vk_fps.h"
 #include "vk_menu.h"
@@ -3468,6 +3469,11 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         dump_present(presents);
         if (src && (dev.offscreen || shots) && offscreen_init()) {
             if (dev.offscreen) {
+                // (hookshot) DLSS 5 neural rendering here too, as present_image does it: with no window (HOS_HEADLESS)
+                // present_image is never reached. The same call and guard: not where the chain already ran it
+                VkImageView nr_view = VK_NULL_HANDLE;
+                if (!dlss_nr_before_hud())
+                    if (const VkImage nr = nr::apply(r.cmd, src, sw, sh, &nr_view)) src = nr;
                 image_barrier(r.cmd, off_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 blit_crop(r.cmd, src, sw, sh, crop, off_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                           dev.swap_extent.width, dev.swap_extent.height);
@@ -4059,6 +4065,13 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     if (vkBeginCommandBuffer(f.cmd, &bi) == VK_ERROR_DEVICE_LOST) device_lost();
     VkImage dst = dev.swap_images[index];
     full_barrier(f.cmd);   // (after the game's work for the frame: earlier submits on this queue)
+    // (hookshot) DLSS 5 neural rendering over a frame the temporal chain did not make (no temporal upscaler, or Stage set to
+    // the present), before anything of ours is drawn on top: the model gets the picture, not the menu or the FPS counter. It
+    // gives back an image of its own; a frame it could not do returns null and goes to the window exactly as before
+    if (src && !dlss_nr_before_hud()) {
+        VkImageView nr_view = VK_NULL_HANDLE;
+        if (const VkImage up = nr::apply(f.cmd, src, sw, sh, &nr_view)) src = up, view = nr_view;
+    }
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     const PresentAspect aspect{src && host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
     const PresentRect rect = present_rect(sw, sh, crop, dev.swap_extent.width, dev.swap_extent.height, aspect);

@@ -3,6 +3,8 @@
 // game's network runs.
 #pragma once
 
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "vk_internal.h"
@@ -53,5 +55,18 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
 void dlss_fg_idle();
 /// Before the process exits (mkwvk_close_asked): its feature let go with the queue idle
 void dlss_fg_close();
+
+// DLSS 5 neural rendering through NGX (vk_dlssnr_ngx.cpp) is a feature on DLSS's one NGX session: no second
+// NVSDK_NGX_VULKAN_Init, the same runtime folders and project.
+/// NGX started on this device (ngx_init, once): false where DLSS cannot run (RX_VK_DLSS=0 included), the reason logged
+bool dlss_ngx_ready();
+/// Whether a runtime file of this name is in one of the folders NGX looks in (its path in found); where: those folders, for
+/// the log
+bool dlss_ngx_runtime(const char* name, std::string* where, std::string* found);
+/// Held around another feature's NGX calls (its create, evaluate and release): DLSS Frame Gen's own lock, so the two
+/// features' calls never overlap. Taken after the temporal chain's lock where both are held, as DLSS-G's inputs take it
+std::mutex& dlss_ngx_feature_mutex();
+/// Neural rendering's device extensions, asked of NGX (feature 18), added to `want` when the device has them
+void dlss_nr_device_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all);
 
 } // namespace mkwvk

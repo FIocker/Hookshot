@@ -791,10 +791,14 @@ bool dlss_fg_runs(int frames) {
     return !most || frames <= (int)most;
 }
 
-void dlss_fg_device_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all) {
-    if (!fg_possible() || !dev.instance || !dev.physical) return;   // (whenever it may run: the row then needs no restart)
+namespace {
+/// The device extensions NGX says a feature needs on this GPU (asked before the device is made, with DLSS's own folders and
+/// project), added to `want` where the device has them; what it lacks is named in the log. `who` names the feature there
+void feature_device_extensions(NVSDK_NGX_Feature feature, const char* who, std::vector<const char*>& want,
+                               const std::vector<VkExtensionProperties>& all) {
+    if (!dev.instance || !dev.physical) return;
     // (only on a device DLSS may run on: without NVIDIA's NVX extensions (dlss_device_extensions' check) NGX is not asked, so
-    // an AMD or Intel GPU's device is made as without DLSS-G)
+    // an AMD or Intel GPU's device is made as without the feature)
     for (const char* name : {VK_NVX_BINARY_IMPORT_EXTENSION_NAME, VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME}) {
         bool have = false;
         for (const auto& e : all) have |= !strcmp(e.extensionName, name);
@@ -813,7 +817,7 @@ void dlss_fg_device_extensions(std::vector<const char*>& want, const std::vector
     info.PathListInfo.Length = (unsigned)paths.size();
     NVSDK_NGX_FeatureDiscoveryInfo d{};
     d.SDKVersion = NVSDK_NGX_Version_API;
-    d.FeatureID = NVSDK_NGX_Feature_FrameGeneration;
+    d.FeatureID = feature;
     d.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
     d.Identifier.v.ProjectDesc.ProjectId = kProjectId;
     d.Identifier.v.ProjectDesc.EngineType = NVSDK_NGX_ENGINE_TYPE_CUSTOM;
@@ -824,7 +828,7 @@ void dlss_fg_device_extensions(std::vector<const char*>& want, const std::vector
     VkExtensionProperties* props = nullptr;
     const NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(dev.instance, dev.physical, &d, &n, &props);
     if (NVSDK_NGX_FAILED(r)) {
-        logf("vk: DLSS Frame Gen (NGX): NGX did not say which device extensions it needs (%#x)", (unsigned)r);
+        logf("vk: %s (NGX): NGX did not say which device extensions it needs (%#x)", who, (unsigned)r);
         return;
     }
     static std::deque<std::string> names;   // (the names vkCreateDevice is given: kept for the process's life)
@@ -841,8 +845,44 @@ void dlss_fg_device_extensions(std::vector<const char*>& want, const std::vector
         if (!listed) want.push_back(names.emplace_back(name).c_str());
         added += (added.empty() ? "" : ", ") + std::string(name);
     }
-    logf("vk: DLSS Frame Gen (NGX): device extensions: %s%s%s", added.empty() ? "none" : added.c_str(),
+    logf("vk: %s (NGX): device extensions: %s%s%s", who, added.empty() ? "none" : added.c_str(),
          missing.empty() ? "" : "; the device lacks: ", missing.c_str());
+}
+}  // namespace
+
+void dlss_fg_device_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all) {
+    if (!fg_possible()) return;   // (whenever it may run: the row then needs no restart)
+    feature_device_extensions(NVSDK_NGX_Feature_FrameGeneration, "DLSS Frame Gen", want, all);
+}
+
+// ---- DLSS 5 neural rendering (vk_dlssnr_ngx.cpp) on this NGX session ----
+
+bool dlss_ngx_ready() { return dlss_why() != DLSS_ENV_OFF && ngx_init(); }
+
+bool dlss_ngx_runtime(const char* name, std::string* where, std::string* found) {
+    const fs::path game = game_dir();
+    if (where) where->clear();
+    if (found) found->clear();
+    if (game.empty() || game.is_relative()) return false;
+    bool have = false;
+    std::error_code ec;
+    for (const auto& d : runtime_dirs(game)) {
+        if (where) *where += (where->empty() ? "" : ", ") + shown(d);
+        for (const auto& f : fs::directory_iterator(d, ec))
+            if (!have && f.path().filename() == fs::path(name)) {
+                have = true;
+                if (found) *found = shown(f.path());
+            }
+    }
+    return have;
+}
+
+std::mutex& dlss_ngx_feature_mutex() { return fgs().mu; }
+
+void dlss_nr_device_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all) {
+    // (whenever DLSS may run, so the Neural rendering row needs no restart; RX_VK_DLSS_NR=0 asks nothing)
+    if (env_switch("RX_VK_DLSS") == 0 || env_switch("RX_VK_DLSS_NR") == 0) return;
+    feature_device_extensions(NVSDK_NGX_Feature_Reserved18, "DLSS 5 neural rendering", want, all);
 }
 
 void dlss_fg_inputs(VkCommandBuffer cmd, const TemporalFrame& f, const float projection[16], const float view_projection[16],
@@ -1114,6 +1154,17 @@ int dlss_fg_frames(VkCommandBuffer, VkImage, VkImageView, uint32_t, uint32_t, in
 }
 void dlss_fg_idle() {}
 void dlss_fg_close() {}
+bool dlss_ngx_ready() { return false; }
+bool dlss_ngx_runtime(const char*, std::string* where, std::string* found) {
+    if (where) where->clear();
+    if (found) found->clear();
+    return false;
+}
+std::mutex& dlss_ngx_feature_mutex() {
+    static std::mutex m;
+    return m;
+}
+void dlss_nr_device_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
 
 #endif
 
