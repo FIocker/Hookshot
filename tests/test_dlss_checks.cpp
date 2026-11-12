@@ -80,6 +80,31 @@ int main() {
     CHECK("good after bad", decode("\xFF\xC3\xA9", bad) == L"�é" && bad);
     CHECK("no flag asked", dc::utf8_to_wide("\xFF") == L"�");
     CHECK("empty", decode("", bad).empty() && !bad);
+    // ---- which DLSS mode takes a render size (vk_dlss.cpp prepare) ----
+    {
+        // (a 4416x1864 output, the 3840x2160-pixel widescreen picture on a 21:9 screen: NGX's ranges there. Quality,
+        // Balanced and Performance share 50-100 %; Ultra Performance takes its third alone)
+        const dc::ModeRange r[] = {{2208, 932, 4416, 1864}, {1472, 621, 1472, 621}};
+        dc::ModeRange took;
+        CHECK("Performance's half", dc::mode_for(2208, 932, 4416, 1864, r, 2, &took) == 0 && took.max_w == 4416);
+        CHECK("Ultra Performance's exact third", dc::mode_for(1472, 621, 4416, 1864, r, 2, &took) == 1 && took.max_h == 621);
+        // (the game's third of 1864 came out 622: no mode took it, and the game's own network upscaled in DLSS's place)
+        CHECK("Ultra Performance's third rounded up",
+              dc::mode_for(1472, 622, 4416, 1864, r, 2, &took) == 1 && took.min_h == 621 && took.max_h == 622 &&
+              took.min_w == 1472 && took.max_w == 1472);
+        // (a size between the two ranges is no mode's: 42 % between a third and a half)
+        CHECK("between the modes", dc::mode_for(1856, 784, 4416, 1864, r, 2, &took) == -1);
+        // (below a third: past what DLSS scales, never widened into Ultra Performance)
+        CHECK("below a third", dc::mode_for(1471, 620, 4416, 1864, r, 2, &took) == -1);
+        // (a 2560x1440 output's Ultra Performance, 853x480: the game's twelfths make 854 (game_size above))
+        const dc::ModeRange q[] = {{1280, 720, 2560, 1440}, {853, 480, 853, 480}};
+        unsigned w = 0, h = 0;
+        game_size(2560, 1440, 4, w, h);
+        CHECK("1440p Ultra Performance, the menu's size", dc::mode_for(w, h, 2560, 1440, q, 2, &took) == 1);
+        // (a range NGX did not give (zeros) is never widened into)
+        const dc::ModeRange z[] = {{0, 0, 0, 0}};
+        CHECK("no range", dc::mode_for(1472, 622, 4416, 1864, z, 1, &took) == -1);
+    }
     std::puts("dlss checks: ok");
     return 0;
 }

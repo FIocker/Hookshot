@@ -42,6 +42,7 @@ struct ParLock { ParLock() {} ~ParLock() {} };
 static void texture_gpu_wrote(uint64_t, uint64_t) { ++texture_writes; }
 static void rb_hazard_locked(uint64_t lo, uint64_t hi) { ++hazards; hazard_lo = lo; hazard_hi = hi; }
 static bool mirror_on() { return mirrors; }
+static void note_in_place_read(bool = false) {}   // (the readback's part wait: tests/test_readback_part.py checks every such read is noted)
 static Pool* pool_of(uint64_t guest, uint64_t size) {
     ++lookups;
     return have_pool && guest >= pool.lo && guest <= pool.hi && size <= pool.hi - guest ? &pool : nullptr;
@@ -62,6 +63,7 @@ struct Host { const uint8_t* (*gpu_ptr)(uint64_t, uint64_t*); uint64_t (*gpu_gue
 static Host interface{gpu_ptr, gpu_guest};
 static Host* host = &interface;
 
+uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part = nullptr, uint64_t* whole = nullptr);
 #include "direct_write_actual.inc"
 
 static void readback_disabled(bool off) {
@@ -87,6 +89,10 @@ static void page_state(uint64_t guest, uint64_t size, bool expected) {
         const uint64_t after = (guest + size + 4095) & ~4095ull;
         ever = true;
         require(memory_writeback_value(after, 1, &ever) == 0 && !ever, "registered a page beyond the written range");
+        // (written in place: no part of its submission is enough for a read of it, the whole submission is waited for)
+        uint64_t part = 1, whole = 0;
+        require(memory_writeback_value(guest, size, nullptr, &part, &whole) == mem_rec_value && part == 0 && whole == mem_rec_value,
+                "a range written in place must wait for its whole submission");
     }
 }
 

@@ -10,7 +10,12 @@ from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
-DEVICES = {0x73BF: "Navi 21 (RX 6800, 6800 XT, 6900 XT)", 0x73DF: "Navi 22 (RX 6700 XT)"}
+DEVICES = {
+    0x73BF: "Navi 21 (RX 6800, 6800 XT, 6900 XT)",
+    0x73AF: "Navi 21 (RX 6900 XT, XTXH)",
+    0x73A5: "Navi 21 (RX 6950 XT)",
+    0x73DF: "Navi 22 (RX 6700 XT)",
+}
 
 
 def main():

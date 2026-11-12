@@ -13,6 +13,15 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def _with_cache(path):
+    """vk_shader.cpp with the program cache it held before (vk_progcache.cpp and .h beside it, outside the translator stamp): definitions first"""
+    parts = [path.read_text(encoding="utf-8")]
+    for name in ("vk_progcache.cpp", "vk_progcache.h"):
+        if (path.parent / name).exists():
+            parts.append((path.parent / name).read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
 COMPILER = None
 SANITIZE = False
 SOURCE = ROOT / 'gpu/vk/vk_shader.cpp'
@@ -37,16 +46,19 @@ class CacheModuleCleanupTests(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory(prefix='hookshot-cache-cleanup-')
         cls.addClassCleanup(cls.temporary.cleanup)
         directory = Path(cls.temporary.name).resolve()
-        source = SOURCE.read_text(encoding='utf-8')
+        source = _with_cache(SOURCE)
         header = (ROOT / 'gpu/vk/vk_shader.h').read_text(encoding='utf-8')
         structs = '\n'.join(block(header, marker) + ';' for marker in ('struct Stage {', 'struct Program {'))
         structs += '\n' + block(source, 'struct DiskRecord {') + ';'
         functions = '\n'.join(block(source, marker) for marker in (
             'VkShaderModule make_module(', 'uint64_t answers_hash(', 'bool answers_fit(', 'void idx_put('))
         serialization = source[source.index('void put_bytes('):source.index('void program_cache_save(')]
+        if 'struct Reader {' not in serialization:   # (the Reader is vk_progcache.h's, shared with vk_shader.cpp)
+            serialization = block(source, 'struct Reader {') + ';\n' + serialization
         functions += '\n' + serialization + block(source, 'void program_cache_save(')
         functions += '\n' + block(source, 'void program_cache_read(')
         functions += '\n' + block(source, 'void program_cache_load(')
+        functions = functions.replace('bool keep) {', 'bool keep = false) {')   # (its default is in vk_progcache.h now)
         (directory / 'cache_types.inc').write_text(structs, encoding='utf-8')
         (directory / 'cache_functions.inc').write_text(functions, encoding='utf-8')
         cls.executable = directory / 'check.exe'

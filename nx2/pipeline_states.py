@@ -47,6 +47,8 @@ stage numbering; the game still reads it.
             u64 blend[8], u32 vertex attributes[16], u32 attribute count, u32 strides[16], u32 divisors[16],
             u32 blend enables, channel mask, polygon mode, depth clamp, alpha to coverage,
             u32 answers, u32 questions, u32 answers[24] (stage, descriptor, image, type), u8 questions[32], u32 pad[2]
+            (variant 0 with no answers and no questions: the variant nothing bound makes, each texture as its instruction
+            declares it; lists converted from records without texture answers hold those)
     <list>: "HKSTATE1", u32 record size (528), then the records:
             u64 code[4], u64 variant,
             u32 mesh, topology, targets, samples, depth format, has depth, u32 color formats[8] (Vulkan), u8 color types[8],

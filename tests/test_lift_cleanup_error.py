@@ -21,7 +21,7 @@ SOURCE = ROOT / "nx2/make_game.py"
 
 def production():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
-    helpers = {"say", "fail", "gen_print", "write_lift_key", "lifted_before"}
+    helpers = {"say", "fail", "gen_print", "write_lift_key", "lifted_before", "kept_before", "kept_list_fits"}
     definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in helpers]
     assert {node.name for node in definitions} == helpers
     key = next(node for node in tree.body if isinstance(node, ast.Assign) and
@@ -48,7 +48,9 @@ class LiftCleanupErrorTests(unittest.TestCase):
         self.key = self.gen / ".lift_key"
         self.events = []
         self.namespace, self.branch = production()
-        self.namespace.update(work=str(self.work), exefs=str(self.root / "exefs"), env={}, key="b" * 40, PY=["authored-python"])
+        self.namespace.update(work=str(self.work), exefs=str(self.root / "exefs"), env={}, key="b" * 40, PY=["authored-python"],
+                              gen_dir=str(self.gen), KEPT_LIST="lifted_objects.txt", KEPT_SCHEME=1,
+                              kept_lift=[], contextlib=contextlib)
         self.actual_write = self.namespace["write_lift_key"]
 
         def write_key(work, key):

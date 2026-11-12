@@ -50,6 +50,7 @@ struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468
 struct Pre {std::mutex mu;bool abandoned=false;};
 int mode=0,calls=0,destroys=0,logged=0; bool completed=false;
 void logf(const char*,...){++logged;}
+int faults_noted=0; void note_driver_fault(){++faults_noted;}
 #define CHECK(c) do {if(!(c)){std::fprintf(stderr,"CHECK failed line %d: %s\n",__LINE__,#c);std::exit(7);}}while(0)
 const VkComputePipelineCreateInfo* expected_ci=nullptr; VkPipeline* expected_out=nullptr;
 void pin_subgroup(decltype(VkComputePipelineCreateInfo::stage)&stage,unsigned x){CHECK(x==32);CHECK(stage.stage==12);}
@@ -59,12 +60,22 @@ VkResult vkCreateComputePipelines(uintptr_t device,VkPipelineCache cache,unsigne
  CHECK(ci->stage.pName&&std::string(ci->stage.pName)=="main");
  if(expected_ci)CHECK(ci==expected_ci); if(expected_out)CHECK(out==expected_out);
  ++calls;
- if(mode==1)RaiseException(EXCEPTION_ACCESS_VIOLATION,0,0,nullptr);
+ if(mode==1){*out=0xdead;RaiseException(EXCEPTION_ACCESS_VIOLATION,0,0,nullptr);}   // (a handle written, then the fault)
  if(mode==2){*out=VK_NULL_HANDLE;return -4;}
  *out=0xcafe;return VK_SUCCESS;
 }
 void vkDestroyPipeline(uintptr_t device,VkPipeline made,const void*allocator){CHECK(device==dev.device&&made==0xcafe&&allocator==nullptr);++destroys;}
 '''
+
+
+def windows_target(cxx):
+    """The target the game's own build gives this compiler (third_party/a64-kit/tools/toolchain.py native_target): an
+    llvm-mingw clang++ builds for MinGW with -fms-extensions (__try/__except), any other for the MSVC target. llvm-mingw
+    finds no Visual Studio headers, so the MSVC target alone fails there at <windows.h>."""
+    machine=subprocess.run([cxx,'-dumpmachine'],capture_output=True,text=True,timeout=30).stdout.strip()
+    if 'mingw' in machine or 'windows-gnu' in machine:
+        return ['--target=x86_64-w64-mingw32','-fms-extensions']
+    return ['--target=x86_64-pc-windows-msvc']
 
 
 def main():
@@ -92,7 +103,7 @@ int main(int argc,char**argv){
  if(which==4){
   mode=1;VkComputePipelineCreateInfo ci{10};ci.stage={11,12,0x2468,"main"};ci.layout=0x1357;VkPipeline out=0;
   expected_ci=&ci;expected_out=&out;
-  CHECK(guarded_compute(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0&&logged==1);return 0;
+  CHECK(guarded_compute(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0&&logged==1&&faults_noted==1);return 0;
  }
  mode=which==1?1:which==2?2:0;pre.abandoned=which==3;
  std::thread worker([&]{actual_arm(program,&pre);});worker.join();
@@ -105,7 +116,7 @@ int main(int argc,char**argv){
 '''
     with tempfile.TemporaryDirectory(prefix='precompile-seh-') as tmp:
         path=Path(tmp); unit=path/'fixture.cpp';exe=path/'fixture.exe';unit.write_text(cpp,encoding='utf-8')
-        cmd=[args.cxx,'--target=x86_64-pc-windows-msvc','-std=c++20',str(unit),'-o',str(exe),'-fuse-ld=lld']
+        cmd=[args.cxx,*windows_target(args.cxx),'-std=c++20',str(unit),'-o',str(exe),'-fuse-ld=lld']
         if args.linker:cmd+=['-B'+str(args.linker.parent)]
         subprocess.run(cmd,check=True,timeout=60)
         for case in [0,1,2,3,4]:

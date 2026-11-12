@@ -187,13 +187,14 @@ static class Updater
                     setupDigest = DigestText(asset);
                 }
         if (setupUrl == null) throw new InvalidOperationException("The latest release has no " + SetupAsset + ".");
-        var cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HookshotBuilder", "update");
+        var cache = Path.Combine(BuilderHome.Base, "update");
         Directory.CreateDirectory(cache);
         var setup = Path.Combine(cache, SetupAsset);
         w.Note("Downloading the new Hookshot Builder");
         await DownloadWithRetries(w, http, setupUrl, setupApiUrl, setup, setupSize, setupDigest, token);
         var si = new ProcessStartInfo(setup) { UseShellExecute = false, WorkingDirectory = cache };
         foreach (var arg in args) si.ArgumentList.Add(arg);
+        BuilderHome.PassTo(si);
         Process.Start(si);
         Application.Current.Shutdown();
     }
@@ -271,7 +272,7 @@ static class Updater
             // would be the HookshotBuilder folder itself or not a version (the same rule as the setup's and Linux's lists)
             if (name.Length == 0 || name.Length > 128 || name[0] == '.')
                 throw new InvalidOperationException("The latest release's tag is not a version name.");
-            var cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HookshotBuilder", "update");
+            var cache = Path.Combine(BuilderHome.Base, "update");
             Directory.CreateDirectory(cache);
             // (a release with the setup and its list: the setup downloads only the parts that changed since the version installed (a few MB
             // when only the builder's code did), checks them and starts the new builder with these arguments. The whole zip is the fallback)
@@ -282,6 +283,7 @@ static class Updater
                 await DownloadWithRetries(w, http, setupUrl, setupApiUrl, setup, setupSize, setupDigest, token);
                 var ssi = new ProcessStartInfo(setup) { UseShellExecute = false, WorkingDirectory = cache };
                 foreach (var arg in new[] { "--update", folder, "--tag", newTag, "--fetched" }) ssi.ArgumentList.Add(arg);
+                BuilderHome.PassTo(ssi);
                 Process.Start(ssi);
                 Application.Current.Shutdown();
                 return;
@@ -294,7 +296,11 @@ static class Updater
             // (beside this app when that folder takes writing, else in the app data folder)
             var parent = Directory.GetParent(AppContext.BaseDirectory.TrimEnd('\\', '/'))!.FullName;
             string target;
-            try
+            if (BuilderHome.Portable)
+            {
+                target = await Task.Run(() => PortableArchive.Install(zip, BuilderHome.Base, newTag));
+            }
+            else try
             {
                 target = await Unpack(zip, Path.Combine(parent, "HookshotBuilder " + name));
             }
@@ -307,6 +313,7 @@ static class Updater
             if (!File.Exists(exe)) throw new FileNotFoundException("The download has no HookshotBuilder.exe (your antivirus may have removed it).");
             var si = new ProcessStartInfo(exe) { UseShellExecute = false, WorkingDirectory = target };
             foreach (var arg in new[] { "--update", folder, "--tag", newTag, "--fetched" }) si.ArgumentList.Add(arg);
+            BuilderHome.PassTo(si);
             Process.Start(si);
             Application.Current.Shutdown();
         }

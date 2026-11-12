@@ -6,13 +6,14 @@
    distance / 50, at least 1)) and fades only when they meet; it stayed at the old count until a door or a talk replaced it.
    While the frames' own time is the step (carry), the amount is added to the counter's own remainder and the whole frames in
    it are handed out, so the counter moves at the game's rate whatever the frame rate. Otherwise it is cut as the game cuts it:
-   60 fps as before. One remainder per counter address, a few slots (the counters are few), reused oldest first. Not
-   thread-safe by itself: the caller holds a lock. */
+   60 fps as before. One remainder per counter address (or per object: each water surface keeps its own), reused oldest
+   first. 64 slots: a scene's water surfaces each take one every frame, and more of them than slots would evict each other in
+   turn, every one starting again from 0 and standing still. Not thread-safe by itself: the caller holds a lock. */
 #pragma once
 #include <stdint.h>
 #include <string.h>
 
-#define FRAME_WHOLE_SLOTS 16
+#define FRAME_WHOLE_SLOTS 64
 typedef struct {
     uint64_t at[FRAME_WHOLE_SLOTS];
     float rem[FRAME_WHOLE_SLOTS];

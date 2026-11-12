@@ -15,6 +15,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "../gpu/vk/fallback_size_policy.h"   // (program_cache_save and _read note each stage's phis)
 #ifdef _WIN32
 #include <io.h>
 #else

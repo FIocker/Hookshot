@@ -79,6 +79,10 @@ static class Program
             Update(game, true);
             File.Delete(Path.Combine(Storage.NgxSdk, "LICENSE.txt"));
             Update(game, false); // A leftover DLL alone does not accept NVIDIA's license.
+            File.WriteAllText(Window.SettingsPath, "{\"Dlss\":false,\"DlssLicense\":true}");
+            Update(game, true); // The license accepted is in the settings: the SDK's files gone (deleted, a new builder folder) keep DLSS.
+            File.WriteAllText(Window.SettingsPath, "{\"DlssLicense\":true}");
+            Update(game, true);
             File.WriteAllText(Window.SettingsPath, "{\"Dlss\":true}");
             Update(game, true); // The accepted preference also repairs a partial SDK.
             Check(File.ReadAllText(runtime) == "authored runtime placeholder", "Update decision modified the existing runtime.");

@@ -4,6 +4,7 @@ narrower than 16:9 (a 4:3 CRT, 16:10, 5:4 and narrower, 21:9, 32:9), and the gam
     python -I -B tests/test_widescreen_shapes.py [--cc gcc]
 """
 import argparse
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -68,27 +69,45 @@ int main(int argc, char **argv) {
         ("2.3889", 1440, "3440x1440 2584x1080 2.3889 0.7442 0.1279"),  # 21:9 (3440 x 1440), as before
         ("3.5556", 1440, "5120x1440 3840x1080 3.5556 0.5000 0.2500"),  # 32:9, as before
         ("5.333333", 1080, "5760x1080 4320x810 5.3333 0.3333 0.3333"),
-        ("5.333333", 1440, "6528x1224 4896x918 5.3333 0.3333 0.3333"),
-        ("5.3333", 1440, "6528x1224 4896x918 5.3333 0.3333 0.3333"),
+        ("5.333333", 1440, "7680x1440 5760x1080 5.3333 0.3333 0.3333"),   # 48:9 at 1440: 5120 x 2160's pixels, full size
+        ("5.3333", 1440, "7680x1440 5760x1080 5.3333 0.3333 0.3333"),
         ("0", 1440, "0x0 0x0 0.0000 0.0000 0.0000"),                   # Ultrawide off
+        # (at the 4K output: a 21:9 screen's native picture, 5120 x 2160, host/hos_wide_size.h's most pixels; a 32:9 one kept
+        # to those pixels, its shape kept)
+        ("2.3704", 2160, "5120x2160 3840x1620 2.3704 0.7500 0.1250"),  # 21:9 (5120 x 2160): native
+        ("3.5556", 2160, "6256x1760 4696x1320 3.5545 0.5001 0.2499"),  # 32:9 (7680 x 2160): 5120 x 2160's pixels
+        ("5.333333", 2160, "7680x1440 5760x1080 5.3333 0.3333 0.3333"),  # 48:9 (11520 x 2160): 5120 x 2160's pixels, exactly 48:9
     )
     with tempfile.TemporaryDirectory(prefix="widescreen-") as tmp:
         work = Path(tmp)
         source, exe = work / "fixture.c", work / "fixture.exe"
         source.write_text(fixture, encoding="utf-8")
         subprocess.run([args.cc, "-std=c11", "-I", str(ROOT), str(source), "-o", str(exe), "-lm"], check=True)
+        env = {k: v for k, v in os.environ.items() if k != "HOS_WIDE_MAX_PX"}
         bad = []
         for want, height, expect in cases:
-            got = subprocess.run([str(exe), want, str(height)], capture_output=True, text=True, check=True).stdout.strip()
+            got = subprocess.run([str(exe), want, str(height)], capture_output=True, text=True, check=True, env=env).stdout.strip()
             if got != expect:
                 bad.append("ratio %s at %u: %s, expected %s" % (want, height, got, expect))
         for width, height, expect in (
             (5760, 1080, "5760x1080 4320x810 5.3333 0.3333 0.3333"),
-            (7680, 1440, "6528x1224 4896x918 5.3333 0.3333 0.3333"),
+            (7680, 1440, "7680x1440 5760x1080 5.3333 0.3333 0.3333"),
         ):
-            got = subprocess.check_output([str(exe), "1.7778", str(height), str(width)], text=True).strip()
+            got = subprocess.check_output([str(exe), "1.7778", str(height), str(width)], text=True, env=env).strip()
             if got != expect:
                 bad.append("explicit surround %ux%u: %s, expected %s" % (width, height, got, expect))
+        # (HOS_WIDE_MAX_PX over the most pixels: 3840 x 2160's, the cap before, keeps 21:9 at the 4K output below native,
+        # and 48:9 at 1440 at its aligned 6528 x 1224)
+        old_cap = dict(env, HOS_WIDE_MAX_PX="8294400")
+        for args_, expect in (
+            (("2.3704", "2160"), "4416x1864 3312x1398 2.3691 0.7504 0.1248"),
+            (("5.333333", "1440"), "6528x1224 4896x918 5.3333 0.3333 0.3333"),
+            (("5.3333", "1440"), "6528x1224 4896x918 5.3333 0.3333 0.3333"),
+            (("1.7778", "1440", "7680"), "6528x1224 4896x918 5.3333 0.3333 0.3333"),
+        ):
+            got = subprocess.check_output([str(exe), *args_], text=True, env=old_cap).strip()
+            if got != expect:
+                bad.append("HOS_WIDE_MAX_PX=8294400, %s: %s, expected %s" % (" ".join(args_), got, expect))
         if bad:
             raise SystemExit("FAIL:\n  " + "\n  ".join(bad))
     print("PASS: widescreen sizes for 4:3, 16:10, 5:4, 16:9, 21:9, 32:9 and 48:9 screens")

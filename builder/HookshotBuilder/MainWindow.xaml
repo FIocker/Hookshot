@@ -320,6 +320,11 @@
           </StackPanel>
           <Button x:Name="LaunchFolder" Style="{StaticResource LinkButton}" Foreground="{StaticResource InkFaint}" HorizontalAlignment="Center"
                   Margin="0,22,0,0" Content="Open the game folder" Click="LaunchFolderClick"/>
+          <!-- (Save my pipeline list: the zip for the "Submit your pipelines" issue, LaunchShareClick) -->
+          <Button x:Name="LaunchShare" Style="{StaticResource LinkButton}" Foreground="{StaticResource InkFaint}" HorizontalAlignment="Center"
+                  Margin="0,6,0,0" Content="Save my pipeline list (helps remove stutter)" Click="LaunchShareClick"/>
+          <TextBlock x:Name="LaunchShareStatus" FontSize="12" Foreground="{StaticResource InkSoft}" TextWrapping="Wrap" MaxWidth="560"
+                     TextAlignment="Center" HorizontalAlignment="Center" Margin="0,4,0,0" Visibility="Collapsed"/>
         </StackPanel>
 
         <!-- ===== when something goes wrong ===== -->

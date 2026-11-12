@@ -22,7 +22,7 @@ def main():
     squeeze = squeeze[:squeeze.index("budget = std::min")]
     if "block_free >= allowed / 8" not in squeeze or "&& !room_in_blocks)" not in squeeze:
         raise SystemExit("the 97% squeeze runs whatever room VMA's blocks hold (a ratchet that drains a paused game's textures)")
-    if 'getenv("RX_VK_SQUEEZE_ALWAYS")' not in tex:
+    if 'env_on("RX_VK_SQUEEZE_ALWAYS")' not in tex:
         raise SystemExit("RX_VK_SQUEEZE_ALWAYS=1 does not bring the old squeeze back")
     if "room in the blocks: not squeezed" not in tex:
         raise SystemExit("the VRAM log line does not say when the squeeze waited")

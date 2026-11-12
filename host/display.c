@@ -20,6 +20,9 @@
 void rx_close_asked(void);   /* host/rx_backend.c */
 #include "../gpu/vk/vk_api.h"
 #include "display_pointer.h"
+#ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/hookshot_env.h"
+#endif
 
 void hos_relaunch_ask(void);        /* (host/hos_relaunch.c) */
 void hos_window_closed_exit(void);
@@ -137,7 +140,7 @@ static void set_fullscreen(HWND w, int on) {
 }
 
 static void dpi_aware_thread(void) {
-    if (getenv("HOS_DPI_UNAWARE")) return;
+    if (env_on("HOS_DPI_UNAWARE")) return;
     typedef void *(WINAPI * SetCtx)(void *);
     SetCtx set = (SetCtx)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetThreadDpiAwarenessContext");
     if (set) set((void *)(intptr_t)-4);
@@ -466,7 +469,7 @@ static DWORD WINAPI display_main(void *p) {
     }
     RECT r = {0, 0, win_w, win_h};
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    const int noactivate = getenv("HOS_WINDOW_NOACTIVATE") != NULL;
+    const int noactivate = env_on("HOS_WINDOW_NOACTIVATE");
     hwnd = CreateWindowA("Hookshot", HOS_GAME_TITLE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                          CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) display_start_failed("CreateWindowA");
@@ -506,7 +509,7 @@ void hos_renderer_wait(void) {
 }
 
 void hos_display_start(void) {
-    if (getenv("HOS_HEADLESS")) {   /* no window: the renderer still draws, offscreen (screenshots, frame dumps) */
+    if (env_on("HOS_HEADLESS")) {   /* no window: the renderer still draws, offscreen (screenshots, frame dumps) */
         rx_start(NULL);
         return;
     }

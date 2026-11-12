@@ -1,5 +1,6 @@
 #include "../gpu/vk/upscaler_rows.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
@@ -238,6 +239,31 @@ int main() {
         CHECK("render: the game's own as before", up == GAME && res == 1);
         CHECK("render row never fixed", !ur::render_fixed(DLAA) && !ur::render_fixed(FSR4_AA) && !ur::render_fixed(DLSS) &&
                                             !ur::render_fixed(GAME) && !ur::render_fixed(FSR3));
+    }
+    {   // the texture LOD bias added to the game's -0.5 (its materials' bias for its own 3/4): NVIDIA's guide for DLSS
+        // (native bias + log2(render / output) - 1), the output's mips for FSR, nothing for the rest
+        const auto near = [](float a, float b) { return std::fabs(a - b) < 1e-3f; };
+        const auto total = [&](int up, int share) { return -0.5f + ur::upscale_lod_bias_for(up, share, -1.0f); };
+        const auto nvidia = [](float r) { return -0.5f - std::log2(0.75f) + std::log2(r) - 1.0f; };   // (native bias ~ -0.085)
+        for (int share : {3333, 5000, 5833, 6667, 7500, 9167})
+            CHECK("DLSS: NVIDIA's mip bias at each fixed share", near(total(DLSS, share), nvidia(share / 10000.0f)));
+        CHECK("DLSS Quality: 1.17 more", near(ur::upscale_lod_bias_for(DLSS, 6667, -1.0f), -1.1699f));
+        CHECK("DLSS Performance: 1.58 more", near(ur::upscale_lod_bias_for(DLSS, 5000, -1.0f), -1.585f));
+        CHECK("DLAA: the output's own size, -1 in all", near(total(DLAA, 0), nvidia(1.0f)) && near(total(DLAA, 6667), nvidia(1.0f)));
+        CHECK("DLSS at Auto: the game's 3/4", near(total(DLSS, 0), nvidia(0.75f)));
+        CHECK("every DLSS bias is negative and lower at smaller shares",
+              ur::upscale_lod_bias_for(DLSS, 3333, -1.0f) < ur::upscale_lod_bias_for(DLSS, 5000, -1.0f) &&
+                  ur::upscale_lod_bias_for(DLSS, 5000, -1.0f) < ur::upscale_lod_bias_for(DLSS, 6667, -1.0f) &&
+                  ur::upscale_lod_bias_for(DLAA, 0, -1.0f) < 0.0f);
+        CHECK("offset 0: the render size's own detail (as before)", near(ur::upscale_lod_bias_for(DLSS, 6667, 0.0f), std::log2(6667 / 7500.0f)) &&
+                                                                      ur::upscale_lod_bias_for(DLSS, 0, 0.0f) == 0.0f &&
+                                                                      ur::upscale_lod_bias_for(DLAA, 0, 0.0f) == 0.0f);
+        CHECK("FSR: the output's mips below 3/4 only", near(ur::upscale_lod_bias_for(ur::FSR3, 5000, -1.0f), std::log2(5000 / 7500.0f)) &&
+                                                         ur::upscale_lod_bias_for(ur::FSR4, 0, -1.0f) == 0.0f &&
+                                                         ur::upscale_lod_bias_for(ur::FSR3, 10000, -1.0f) == 0.0f);
+        CHECK("no bias for the game's own, Off and FSR 4's native AA",
+              ur::upscale_lod_bias_for(GAME, 6667, -1.0f) == 0.0f && ur::upscale_lod_bias_for(ur::OFF, 5000, -1.0f) == 0.0f &&
+                  ur::upscale_lod_bias_for(ur::FSR4_AA, 0, -1.0f) == 0.0f);
     }
     std::puts("upscaler rows: all checks passed");
 }

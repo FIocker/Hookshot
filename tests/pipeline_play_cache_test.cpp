@@ -26,6 +26,7 @@ void Sleep(unsigned ms) { std::this_thread::sleep_for(std::chrono::milliseconds(
 using VkResult = int;
 constexpr VkResult VK_SUCCESS = 0, VK_ERROR_UNKNOWN = -13, VK_PIPELINE_COMPILE_REQUIRED = 1000297000;
 constexpr unsigned VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT = 0x100;
+constexpr unsigned VK_PIPELINE_CREATE_LIBRARY_BIT_KHR = 0x800;
 enum { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO = 17 };
 struct FakeCache {
     std::mutex mu;
@@ -230,7 +231,7 @@ int run(const std::string& name) {
         CHECK(make(2) == VK_SUCCESS && g->from_driver == 1 && keys_of(g->cache) == std::set<uint64_t>{2});
         CHECK(make(4) == VK_SUCCESS && g->compiled == 1 && compiles == 2 && keys_of(g->cache) == (std::set<uint64_t>{2, 4}));
         CHECK(g->built == 2);
-        // (one the caller already asks without compiling, as a dispatch and the stage libraries do: the same order, no compile)
+        // (one the caller already asks without compiling, as a dispatch does: the same order, no compile)
         constexpr unsigned ask = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
         CHECK(make(5, ask) == VK_PIPELINE_COMPILE_REQUIRED);   // (nowhere: not compiled)
         CHECK(compiles == 2 && !has(g->cache, 5) && !has(pcache, 5));
@@ -238,6 +239,22 @@ int run(const std::string& name) {
         CHECK(make(6, ask) == VK_SUCCESS && has(g->cache, 6) && !has(pcache, 6));   // (the driver's: into the generation)
         CHECK(make(1, ask) == VK_SUCCESS && g->from_start == 2);   // (the start's cache's: from it)
         CHECK(compiles == 2 && size_of(pcache) == start && keys_of(pcache) == (std::set<uint64_t>{1, 3}));   // (left as it was read)
+        // (a stage library asked without compiling: the start's cache first, where the warm pass put the libraries, so the
+        // driver's own cache is not gone to for it; then the generation; no compile)
+        constexpr unsigned lib = ask | VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+        const int64_t driver0 = g->from_driver.load(), built0 = g->built.load();
+        CHECK(make(7, lib) == VK_PIPELINE_COMPILE_REQUIRED && compiles == 2 && !has(g->cache, 7) && !has(pcache, 7));
+        CHECK(make(1, lib) == VK_SUCCESS && g->from_start == 3 && size_of(pcache) == start);   // (the start's cache's: from it)
+        CHECK(g->from_driver == driver0 && g->built == built0);                             // (and nothing asked of the generation)
+        driver.insert(8);
+        // (one the warm pass did not leave in the start's cache: the driver answers the ask of it and copies it in, in memory)
+        CHECK(make(8, lib) == VK_SUCCESS && g->from_start == 4 && has(pcache, 8) && !has(g->cache, 8));
+        {   // (one the generation alone holds, on a driver with no cache of its own: from the generation)
+            std::lock_guard lk(g->cache->mu);
+            g->cache->keys.insert(9);
+        }
+        CHECK(make(9, lib) == VK_SUCCESS && g->from_driver == driver0 + 1 && !has(pcache, 9));
+        CHECK(compiles == 2 && keys_of(pcache) == (std::set<uint64_t>{1, 3, 8}));
         play_cache_begin();   // (once)
         CHECK(play_cache.load() == g);
     } else if (name == "save") {

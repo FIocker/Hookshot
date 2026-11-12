@@ -21,7 +21,7 @@ using VmaAllocation = void*;
 constexpr int kMaxMult = 8;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 /* ACTUAL_STATE */
-struct { int framegen = 2, hdr_white = 200, hdr_peak = 1000; } opts;
+struct { int framegen = 2, hdr_white = 200, hdr_peak = 1000, hdr_contrast = 100; } opts;
 struct { bool push_descriptor = true; std::mutex present_mu; } dev;
 constexpr bool vkCmdPushDescriptorSetKHR = true;
 constexpr uint32_t HDR_ENCODE_COMP_SPV[] = {0};
@@ -36,6 +36,11 @@ float hdr_uv[4]{};
 int blits = 0, clears = 0, initializations = 0, sizes = 0, dispatches = 0, copies = 0;
 uint32_t allocated_w = 0, allocated_h = 0;
 namespace fsr3fi { bool wanted = false; bool frames_wanted() { return wanted; } }
+// (NVIDIA DLSS Frame Generation through NGX, vk_dlss.cpp: not asked for here, so the sets are the renderer's own)
+bool dlss_fg_wanted() { return false; }
+int dlss_fg_frames(VkCommandBuffer, VkImage, VkImageView, uint32_t, uint32_t, int, const VkImage*, const VkImageView*, bool,
+                   uint64_t) { return 0; }   // (asked every present at 2x and up: makes none here)
+uint64_t reflex_frame() { return 0; }   // (vk_reflex.cpp: NVIDIA Reflex not on here)
 int fsr_calls = 0, fsr_result = 1;
 int fsr3fi_frame(VkCommandBuffer, OutSet&, int, uint32_t w, uint32_t h, uint64_t sequence) {
     CHECK(w == allocated_w && h == allocated_h && sequence > 0);
@@ -66,7 +71,7 @@ void pass(VkCommandBuffer, const Pipe& p, std::initializer_list<std::pair<VkImag
           uint32_t, uint32_t, const void* pc = nullptr, uint32_t bytes = 0) {
     ++dispatches;
     if (&p == &fg.copy) { CHECK(bytes == sizeof copy_pc); std::memcpy(copy_pc, pc, bytes); }
-    if (&p == &hdr.pipe) { CHECK(bytes == 32); std::memcpy(hdr_uv, pc, sizeof hdr_uv); }
+    if (&p == &hdr.pipe) { CHECK(bytes == 48); std::memcpy(hdr_uv, pc, sizeof hdr_uv); }
 }
 void vkCmdCopyImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
                     uint32_t count, const VkImageCopy* c) {
@@ -117,7 +122,7 @@ void check(uint32_t sw, uint32_t sh, const int* crop, uint32_t x, uint32_t y, ui
     // Execute the actual HDR consumer, keeping resources ready to isolate source validation.
     hdr.init = true; hdr.failed = false; hdr.w = 1920; hdr.h = 1080; hdr.out.image = 77;
     const int before = dispatches;
-    CHECK(framegen_hdr(nullptr, 1, sw, sh, crop, 1920, 1080) == (valid ? 77 : VK_NULL_HANDLE));
+    CHECK(framegen_hdr(nullptr, 1, sw, sh, crop, 1920, 1080, false) == (valid ? 77 : VK_NULL_HANDLE));
     CHECK(dispatches == before + int(valid));
     if (valid) {
         CHECK(hdr_uv[0] == x / float(sw) && hdr_uv[1] == y / float(sh));

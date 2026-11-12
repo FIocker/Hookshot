@@ -108,6 +108,8 @@ int save_replace(const char* from, const char* to, unsigned flags) {
 // cache's own part, whatever that did.
 std::atomic<int> play_saves{0};
 void play_cache_save() { ++play_saves; }
+std::atomic<bool> in_play{false};
+bool play_cache_in_use() { return in_play.load(); }
 
 #define fwrite save_fwrite
 #define MoveFileExA save_replace
@@ -229,6 +231,25 @@ int run(const std::string& name) {
         pipeline_cache_save(true);
         CHECK(copies == 4 && replacements == 3 && new_file());
         CHECK(save_errors == 0 && start_errors == 0 && play_saves == 8);
+    } else if (name == "in-play") {
+        // In play the cache is not written at a save for a little growth: what play makes is in the play files.
+        pcache_saved_size = 64;
+        cache_size = 96;
+        in_play = true;
+        pcache_built_since_save = 32;
+        pipeline_cache_save(false);
+        CHECK(wait_until(play_saves, 1));
+        CHECK(copies == 0 && writes == 0 && replacements == 0);
+        pipeline_cache_save(true);  // Waits for the worker; a forced save (Restart now) writes it once.
+        CHECK(play_saves == 2 && copies == 1 && writes == 1 && replacements == 1 && new_file() && pcache_saved_size == 96);
+        // Grown past the threshold (64 MB), it is written in play too.
+        cache_size = 96 + (64u << 20);
+        pcache_built_since_save = 32;
+        pipeline_cache_save(false);
+        CHECK(wait_until(play_saves, 3));
+        pipeline_cache_save(true);
+        CHECK(copies == 2 && writes == 2 && replacements == 2 && pcache_saved_size == 96 + (64u << 20));
+        CHECK(save_errors == 0 && start_errors == 0);
     } else {
         CHECK(false);
     }

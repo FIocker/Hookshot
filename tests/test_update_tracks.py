@@ -155,6 +155,8 @@ class Tracks(unittest.TestCase):
         source = (ROOT / "host/hos_update.c").read_text(encoding="utf-8")
         guard = "if (strchr(have, '-') && !nightly_version(have) && !newer_version(tag, have)) return;"
         self.assertEqual(source.count(guard), 2)   # (Windows and Linux)
+        # and a release (or one) newer than the latest is offered nothing: a test build of the next release, not the last one
+        self.assertEqual(source.count("if (!nightly_version(have) && newer_version(have, tag)) return;"), 2)
         self.assertEqual(source.count("if (!latest_tag(have, tag, sizeof tag)) {"), 2)
 
 

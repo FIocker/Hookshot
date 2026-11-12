@@ -93,9 +93,10 @@ class Committed(unittest.TestCase):
         c = Path(tool.sources_dir(), tool.CONTRIB)
         old = []
         for name, n in MIGRATED.items():
+            # (a list may grow: add keeps the pipelines it holds first, so the migrated ones are its first n)
             recs = tool.read(str(c / (name + tool.EXT)), strict=True)
-            self.assertEqual(len(recs), n, name)
-            old += recs
+            self.assertGreaterEqual(len(recs), n, name)
+            old += recs[:n]
         self.assertEqual(len(set(old)), sum(MIGRATED.values()), "the split lists overlap")
         self.assertEqual(hashlib.sha256(b"".join(sorted(old))).hexdigest(), MIGRATED_SHA256,
                          "the split lists no longer hold assets/pipeline_states.bin.xz's pipelines")

@@ -243,9 +243,20 @@ def _kept_version(d):
     return bool(cur) and _same(cur, d)
 
 
+def kept_translation(sa):
+    """make_game.py keep_translation left the lift's small files in sa (its .lift_key marked "kept"): the next update with the same
+    tools skips the lift with them. Not let go after a build (Free up space still lets them go)"""
+    try:
+        with open(os.path.join(sa, "gen", ".lift_key"), encoding="utf-8") as f:
+            return f.read().split()[2:3] == ["kept"]
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def freeable(after_build=False):
     for d in (("sa", "exefs", "probe") if after_build else ("objcache", "sa", "exefs", "probe")):
-        yield os.path.join(work(), d)
+        if not (after_build and d == "sa" and kept_translation(os.path.join(work(), d))):
+            yield os.path.join(work(), d)
     for d in ("downloads", "update"):
         yield os.path.join(paths.base(), d)
     v = paths.versions()

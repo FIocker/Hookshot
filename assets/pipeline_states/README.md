@@ -2,7 +2,9 @@
 
 **These are not Nintendo files, and they hold no game code or game data.** Each is a list of Vulkan pipelines that
 Hookshot's renderer made while someone played on their own PC, written by Hookshot itself. Keep it that way: only lists
-written by Hookshot and this folder's tool go in here.
+written by Hookshot and this folder's tool go in here. The lists named `contrib/pmwork-personal-fritchii-recipe*` are converted
+instead: made from the pipeline records another emulator ships for the game (hashes and draw state, no code), matched to
+Hookshot's shader hashes; their notes say how. They hold the same records as any other list and nothing more.
 
 - **What a record is:** one pipeline the game asked for. Each record holds:
   - the hashes of its shaders and of the program variant
@@ -37,6 +39,16 @@ because the tour's list is replaced whole and a later tour may not find them. Wh
 a pipeline again, the merge keeps it once.
 
 ## Contributing a list
+
+Players without a clone send their list to the [Submit your pipelines](https://github.com/NotRexed/Hookshot/issues/2034)
+issue: **Save my pipeline list** (the game's menu, Debug tab, or the builders' launcher page; readme, *Send your
+pipeline list*) zips the game folder's `hookshot_pipeline_states.bin` with a filled-in report
+(`hookshot_pipeline_report.txt`: the version, OS, GPU and driver, settings and mods), and nothing else. A maintainer then
+adds it as below, with the report's lines as `--gpu`, `--build`, `--settings` and `--route`. The zip is made by
+`gpu/vk/pipeline_share.h` in the game and `nx2/pipeline_share.py` in the builders, after the same checks as
+`nx2/pipeline_states.py --check`.
+
+With a clone:
 
 1. Build the game from current `main`. A list from an older build may hold pipelines the current build no longer asks
    for.

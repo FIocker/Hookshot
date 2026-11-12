@@ -36,8 +36,8 @@ def main():
         raise SystemExit("the shader header does not define SHADOW_STAB_COMP_SPV")
 
     weight = body(draw, "float mask_weight()")
-    if '"RX_VK_MASK_BLEND"' not in weight or "0.85f" not in weight or "0.0f, 0.95f" not in weight:
-        raise SystemExit("the blend weight is not RX_VK_MASK_BLEND, 0.85 by default, 0 to 0.95")
+    if '"RX_VK_MASK_BLEND"' not in weight or ": 0.0f, 0.0f, 0.95f" not in weight:
+        raise SystemExit("the blend weight is not RX_VK_MASK_BLEND, off by default (a GPU hang near Hyrule Castle), 0 to 0.95")
 
     # (the tree-shadow pass's draw sets the guard, and only when the weight is on: 0 leaves the frame as main draws it)
     guard = draw[draw.index("struct MaskGuard"):]

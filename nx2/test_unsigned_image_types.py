@@ -11,6 +11,9 @@ from pathlib import Path
 import subprocess
 import tempfile
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/hookshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "hookshot_env.h")
+
 RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"]
 # (spirv-val: SPIRV-Tools comes with the Linux runner's packages, not on Windows)
 RUN_ALL_SKIP = {"windows": "needs spirv-val: checked on Linux"}
@@ -39,7 +42,7 @@ def main():
     sources = sorted({p for directory in ('eden/shader_recompiler/backend/spirv',
                       'eden/shader_recompiler/frontend/ir', 'eden/shader_recompiler/ir_opt', 'sirit/src')
                       for p in (vk / directory).rglob('*.cpp')})
-    flags = ['-std=c++20', '-O1', '-D_CRT_SECURE_NO_WARNINGS', '-DVK_NO_PROTOTYPES', '-DMKWVK_INCLUDES=2']
+    flags = ['-std=c++20', '-include', ENV_ON_H, '-O1', '-D_CRT_SECURE_NO_WARNINGS', '-DVK_NO_PROTOTYPES', '-DMKWVK_INCLUDES=2']
     for header in ('algorithm', 'cstdio', 'cstdlib', 'cstring', 'functional', 'string', 'vector'):
         flags += ['-include', header]
     flags += ['-I' + str(p) for p in (vk / 'compat', ROOT / 'gpu/compat', vk / 'eden',

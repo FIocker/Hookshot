@@ -11,6 +11,15 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def _with_cache(path):
+    """vk_shader.cpp with the program cache it held before (vk_progcache.cpp and .h beside it, outside the translator stamp): definitions first"""
+    parts = [path.read_text(encoding="utf-8")]
+    for name in ("vk_progcache.cpp", "vk_progcache.h"):
+        if (path.parent / name).exists():
+            parts.append((path.parent / name).read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
 SOURCE = ROOT / "gpu" / "vk" / "vk_shader.cpp"
 
 
@@ -26,7 +35,7 @@ def block(text, marker):
 
 class ProgramCacheIndexTests(unittest.TestCase):
     def setUp(self):
-        self.source = SOURCE.read_text(encoding="utf-8")
+        self.source = _with_cache(SOURCE)
 
     def test_index_after_record(self):
         save = block(self.source, "void program_cache_save(")

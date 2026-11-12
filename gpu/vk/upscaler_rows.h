@@ -2,6 +2,9 @@
    Upscaler, and the names it shows for DLSS's (and FSR 3.1's and FSR 4's) modes. No Vulkan, no menu: tests/test_upscaler_rows.cpp checks them. */
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+
 namespace mkwvk::upscaler_rows {
 
 /// The Upscaler row (opts.dlss, RX_VK_DLSS): the game's own network, NVIDIA DLSS, NVIDIA DLAA, AMD FSR 3.1 (built from AMD's
@@ -196,6 +199,26 @@ inline void step_render(int upscaler, int v, int dir, int* up, int* res) {
 /// The Render resolution row has nothing to choose only for a full-size upscaler whose engine has no Native step (none now:
 /// DLAA and FSR 4's native AA are their engines' Native)
 inline bool render_fixed(int upscaler) { return full_scale(upscaler) && native_of(engine(upscaler)) < 0; }
+
+/// The texture LOD bias the upscalers add to the game's world materials (the samplers it biases below 0: -0.5 everywhere, for
+/// its network's 3/4 share, about log2(0.75)). share: the Render resolution's in 1/10000 of the output, 0 at Auto (the
+/// game's dynamic size, 3/4 of the output in play). offset: DLSS's extra step, below.
+///  - DLSS and DLAA: NVIDIA's guide (DLSS Programming Guide 3.5): the game's bias at native size + log2(render / output)
+///    - 1.0, so DLSS's network gets the texture detail of the output's size and a little more, which it resolves over its
+///    frames. The game's materials are tuned to -0.5 at 3/4, about 0 at native size, so on top of its -0.5 that is
+///    log2(share / 0.75) + offset, offset -1 by default (RX_VK_DLSS_LOD_OFFSET): Quality (67 %) -1.17, Performance -1.58,
+///    DLAA -0.58, Auto -1. Without the -1 DLSS was given the render size's own texture detail (Quality -0.17, DLAA and Auto
+///    nothing), the soft textures it then upscaled
+///  - FSR 3.1 and FSR 4: log2(share / 0.75) below 75 % (the mips the output's size wants), 0 at Auto and above
+///  - the game's own, Off, FSR 4's native AA: 0
+inline float upscale_lod_bias_for(int upscaler, int share, float offset) {
+    if (is_dlss(upscaler)) {
+        const float r = upscaler == DLAA ? 1.0f : share > 0 ? (float)share / 10000.0f : 0.75f;
+        return std::min(0.0f, std::log2(r / 0.75f) + offset);
+    }
+    if (!scales_by_mode(upscaler) || share <= 0) return 0.0f;
+    return std::min(0.0f, std::log2((float)share / 7500.0f));
+}
 
 /// The DLSS model row (opts.dlss_model, saved as dlss_model): which of NVIDIA's networks DLSS and DLAA draw with, by its
 /// preset (NVSDK_NGX_DLSS_Hint_Render_Preset_*). 0 the transformer, preset K (the default here, the one tested); 1 the second

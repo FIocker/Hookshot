@@ -153,13 +153,19 @@ def update_target(latest, tools, switch=False):
     return latest if have and out and out > have else tools
 
 
+def older_version(target, have):
+    """Known version order only: arbitrary hashes and differing nightlies cannot establish commit ancestry."""
+    old, new = release_key(have), release_key(target)
+    return bool(old and new and new < old)
+
+
 def choose_mode(game, tools, latest, source_picked, kept, switch=False):
-    """What the builder's button does. The same order as the Windows builder (MainWindow.RefreshMode): an older game
-    that still has its files is updated, a game at the newest known release is played, and an older builder updates
+    """What the builder's button does: an older game that still has its files is updated, a game at or beyond the
+    newest known release is played unless its track is explicitly switched, and an older builder updates
     itself before a new build. latest None: GitHub did not answer, so the builder's own version is the newest known.
     Newest is update_target's: a builder that is not an older release is not made to update."""
     target = update_target(latest, tools, switch)
-    if kept and game and target and game != target and not source_picked:
+    if kept and game and target and game != target and not source_picked and (switch or not older_version(target, game)):
         return "update-game"
     if game and not source_picked:
         return "up-to-date"
@@ -239,8 +245,32 @@ def game_exe(folder):
 MAX_DOWNLOAD = 4 << 30   # (no part or list is this big: a download that is stops there)
 
 
-def _read_at_most(response, limit):
-    data = response.read(limit + 1)
+class Cancelled(Exception):
+    """The player stopped the update (the builder's Cancel sets the stop event a download is given). It is not tried again,
+    and install removes what it had staged, as for any other error."""
+
+    def __init__(self):
+        super().__init__("The update was cancelled.")
+
+
+def _stopped(stop):
+    if stop is not None and stop.is_set():
+        raise Cancelled()
+
+
+def _read_at_most(response, limit, stop=None):
+    if stop is None:
+        data = response.read(limit + 1)
+    else:   # (a megabyte at a time, stop looked at before each: one read of a part is hundreds of them)
+        pieces, size = [], 0
+        while size <= limit:
+            _stopped(stop)
+            piece = response.read(min(1 << 20, limit + 1 - size))
+            if not piece:
+                break
+            pieces.append(piece)
+            size += len(piece)
+        data = b"".join(pieces)
     if len(data) > limit:
         raise RuntimeError("the download is larger than expected")
     return data
@@ -268,14 +298,14 @@ def _open(req, timeout):
     return _OPENER.open(req, timeout=timeout)
 
 
-def _request(url, timeout, limit=MAX_DOWNLOAD):
+def _request(url, timeout, limit=MAX_DOWNLOAD, stop=None):
     # (no second argument: Request's second is the POST body, and a str body failed every download before connecting)
     req = urllib.request.Request(_https(url), headers={"User-Agent": "Hookshot", "Accept": "application/vnd.github+json"})
     with _open(req, timeout) as response:
-        return _read_at_most(response, limit)
+        return _read_at_most(response, limit, stop)
 
 
-def _api_download(url):
+def _api_download(url, stop=None):
     """A GitHub release link that failed: the same file through the API (scripts/linux/deps.sh does this for 504s)."""
     prefix = "https://github.com/"
     mark = "/releases/download/"
@@ -292,16 +322,19 @@ def _api_download(url):
             req = urllib.request.Request(_https(asset.get("url")), headers={
                 "User-Agent": "Hookshot", "Accept": "application/octet-stream"})
             with _open(req, 120) as response:
-                return _read_at_most(response, MAX_DOWNLOAD)
+                return _read_at_most(response, MAX_DOWNLOAD, stop)
     return None
 
 
-def fetch_bytes(url, timeout=60):
-    """The url's bytes. A GitHub download that the server fails (5xx) is tried again, then through the API."""
+def fetch_bytes(url, timeout=60, stop=None):
+    """The url's bytes. A GitHub download that the server fails (5xx) is tried again, then through the API. stop: an event
+    (threading.Event) that ends it with Cancelled once set, during a read or a wait between tries."""
     delay, last = 2, "the download failed"
     for attempt in range(4):
         try:
-            return _request(url, timeout)
+            return _request(url, timeout, stop=stop)
+        except Cancelled:
+            raise
         except urllib.error.HTTPError as error:
             last = "GitHub answered %s" % error.code
             if error.code < 500 and error.code != 429:
@@ -309,10 +342,16 @@ def fetch_bytes(url, timeout=60):
         except Exception as error:
             last = str(error) or error.__class__.__name__
         if attempt < 3:
-            time.sleep(delay)
+            if stop is None:
+                time.sleep(delay)
+            else:
+                stop.wait(delay)
+                _stopped(stop)
             delay = min(delay * 2, 20)
     try:
-        got = _api_download(url)
+        got = _api_download(url, stop)
+    except Cancelled:
+        raise
     except Exception as error:
         got = None
         last = str(error) or last
@@ -539,11 +578,12 @@ def _finish_tree(dest):
     return apprun
 
 
-def install(manifest, source_root, source, note=None, get=None):
+def install(manifest, source_root, source, note=None, get=None, stop=None):
     """versions/<tag> from the list. Unchanged parts come from source_root. The new folder replaces nothing until it
-    is complete, and the version installed before stays until this one is."""
+    is complete, and the version installed before stays until this one is. stop: an event that ends it with Cancelled once
+    set, in a download or between two parts, up to the moment the new folder is complete."""
     note = note or (lambda message: None)
-    get = get or fetch_bytes
+    get = get or (lambda url: fetch_bytes(url, stop=stop))
     root = data_root()
     versions = os.path.join(root, "versions")
     dest = os.path.join(versions, manifest.tag)
@@ -555,6 +595,7 @@ def install(manifest, source_root, source, note=None, get=None):
     os.makedirs(versions, exist_ok=True)
     try:
         for part in manifest.parts:
+            _stopped(stop)
             _place(part, source_root, source, partial, get, note)
         # The publisher keeps the list outside all hashed parts. Never follow or overwrite a part-supplied leaf.
         with open(os.path.join(partial, LIST_NAME), "x", encoding="utf-8", newline="\n") as handle:
@@ -563,6 +604,7 @@ def install(manifest, source_root, source, note=None, get=None):
                 handle.write("part %s %d %s %s\n" % (part.sha, part.size, part.dest, part.url))
                 handle.write("tree\n" if part.files is None else "".join("file %s\n" % name for name in part.files))
         apprun = _finish_tree(partial)
+        _stopped(stop)   # (the last moment: from here the new version takes the old one's place)
     except Exception:
         shutil.rmtree(partial, ignore_errors=True)
         raise

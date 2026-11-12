@@ -114,6 +114,7 @@ sealed class Runner
         BuildWorkers.Apply(si, workers);
         BuildMemory.Apply(si, memoryGb);
         // (written into the game folder's hookshot_version.txt: the game starts this app again to update, host/hos_update.c)
+        BuilderHome.PassTo(si);
         if (Environment.ProcessPath != null) si.Environment["HOOKSHOT_BUILDER_EXE"] = Environment.ProcessPath;
         // (NVIDIA DLSS: only when ticked. Without it, one set on the PC is not passed on either: a build is with DLSS only when asked)
         if (ngxSdk != null) si.Environment["HOOKSHOT_NGX_SDK"] = ngxSdk;

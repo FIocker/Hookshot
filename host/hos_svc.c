@@ -433,7 +433,11 @@ void a64_svc(Ctx *c, uint32_t imm) {
         return;
     case 0x0B: { /* SleepThread(ns) */
         void hos_sleep_logged(int64_t ns, uint64_t lr);
+        extern _Thread_local int64_t hos_slept_ns[2];   /* (hos_thread.c: the FPS counter's Breakdown, while it shows) */
+        extern volatile int hos_fps_timing;
+        const int64_t t0 = hos_fps_timing ? hos_now_ns() : 0;
         hos_sleep_logged((int64_t)c->x[0], c->x[30] | 1);
+        if (t0) hos_slept_ns[1] += hos_now_ns() - t0;
         return;
     }
     case 0x10:   /* GetCurrentProcessorNumber */

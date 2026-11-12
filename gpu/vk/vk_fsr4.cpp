@@ -43,6 +43,8 @@
 
 namespace mkwvk {
 
+extern std::atomic<bool> present_native_pq;   // (vk_replay.cpp do_present: the game presents its own HDR10 picture, Native)
+
 namespace {
 int env_switch(const char* name) {   // (-1: unset)
     const char* e = getenv(name);
@@ -102,6 +104,10 @@ struct Context {
     ffxContext context = nullptr;
     uint32_t width = 0, height = 0;   // (its output, which is also the most the render size can be)
     uint64_t memory = 0;              // (what AMD's library says it holds)
+    // (made for the game's native HDR (present_native_pq): its scene colour goes past 1 there, and the LDR context, given
+    // the colour clamped to 1, cut every highlight at the paper white. Then it takes linear light, HDR, with AMD's own
+    // exposure, and the chain does not clamp it: hdr())
+    bool hdr = false;
     ~Context() {
         if (context) lib().destroy(&context, nullptr);
     }
@@ -243,7 +249,7 @@ bool load() {
 
 /// A context for outputs of w x h, any render size up to that (the game's dynamic resolution and the Render resolution row
 /// change it every so often: one context takes them all)
-std::shared_ptr<Context> make_context(uint32_t w, uint32_t h) {
+std::shared_ptr<Context> make_context(uint32_t w, uint32_t h, bool hdr) {
     Library& l = lib();
     auto c = std::make_shared<Context>();
     c->backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
@@ -263,8 +269,11 @@ std::shared_ptr<Context> make_context(uint32_t w, uint32_t h) {
     c->upscale.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     c->upscale.header.pNext = &c->backend.header;
     // (the chain's colour is tonemapped and square-root encoded already: LDR, perceptual, no auto exposure; depth not
-    // inverted. The render size changes under the one context)
-    c->upscale.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE | FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
+    // inverted. The render size changes under the one context. With the game's native HDR the chain gives linear light
+    // past 1 (TemporalEngine::hdr): an HDR context, linear, with AMD's auto exposure)
+    c->upscale.flags = (hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE
+                            : FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE) |
+                       FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
     c->upscale.maxRenderSize = {w, h};
     c->upscale.maxUpscaleSize = {w, h};
     c->upscale.fpMessage = &on_message;
@@ -276,7 +285,7 @@ std::shared_ptr<Context> make_context(uint32_t w, uint32_t h) {
         c->context = nullptr;
         return nullptr;
     }
-    c->width = w, c->height = h;
+    c->width = w, c->height = h, c->hdr = hdr;
     FfxApiEffectMemoryUsage usage{};
     ffxQueryDescUpscaleGetGPUMemoryUsage mem{};
     mem.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
@@ -285,9 +294,9 @@ std::shared_ptr<Context> make_context(uint32_t w, uint32_t h) {
     ffxQueryGetProviderVersion provider{};
     provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     const bool known = l.query(&c->context, &provider.header) == FFX_API_RETURN_OK && provider.versionName;
-    logf("vk: AMD FSR 4: FSR %s made for outputs of %ux%u (frame %llu, %.1f ms of CPU; its own %llu MB)",
+    logf("vk: AMD FSR 4: FSR %s made for outputs of %ux%u (frame %llu, %.1f ms of CPU; its own %llu MB)%s",
          known ? provider.versionName : "?", w, h, (unsigned long long)texture_frame_no(), made_ms,
-         (unsigned long long)(c->memory >> 20));
+         (unsigned long long)(c->memory >> 20), hdr ? ", HDR colour, linear (the game's native HDR)" : "");
     return c;
 }
 
@@ -357,9 +366,14 @@ void release() {
 int prepare(VkCommandBuffer, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, uint32_t* in_w, uint32_t* in_h, const char** why) {
     State& s = st();
     int made = 1;
-    if (!s.context || s.context->width != ow || s.context->height != oh) {
+    // (the game's native HDR: Context::hdr. What the game presents, not the option and the swapchain: with Native picked and
+    // the game's picture not PQ, the scene is LDR. RX_VK_FSR4_HDR=0: the LDR context and the clamped colour with Native too)
+    static const bool hdr_allowed = env_switch("RX_VK_FSR4_HDR") != 0;
+    const bool hdr = hdr_allowed && present_native_pq.load(std::memory_order_relaxed);
+    if (!s.context || s.context->width != ow || s.context->height != oh || s.context->hdr != hdr) {
+        if (s.context && s.context->hdr != hdr) logf("vk: AMD FSR 4: made again: the game's native HDR turned %s", hdr ? "on" : "off");
         release();
-        s.context = make_context(ow, oh);
+        s.context = make_context(ow, oh, hdr);
         if (!s.context) return *why = "its upscaler was not made", -1;
         s.in_w = s.in_h = 0;
         made = 2;
@@ -398,7 +412,8 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     d.motionVectors = resource(f.motion, VK_IMAGE_USAGE_SAMPLED_BIT, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     d.output = resource(f.output, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
 #ifndef _WIN32
-    d.exposure = resource(exposure, VK_IMAGE_USAGE_SAMPLED_BIT, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    if (!s.context->hdr)   // (an HDR context works out its own exposure: FFX_UPSCALE_ENABLE_AUTO_EXPOSURE)
+        d.exposure = resource(exposure, VK_IMAGE_USAGE_SAMPLED_BIT, FFX_API_RESOURCE_STATE_COMPUTE_READ);
 #endif
     d.jitterOffset = {f.jitter[0], f.jitter[1]};   // (render pixels, as the projection was offset: the same as DLSS's)
     d.motionVectorScale = {1.0f, 1.0f};             // (render pixels already, towards the frame before)
@@ -411,7 +426,7 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     d.reset = f.reset;
     d.cameraNear = f.near_z, d.cameraFar = f.far_z, d.cameraFovAngleVertical = f.fov_y;
     d.viewSpaceToMetersFactor = 1.0f;
-    d.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+    d.flags = s.context->hdr ? 0u : (uint32_t)FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;   // (HDR: linear light)
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (ffxDispatch records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
     const ffxReturnCode_t r = l.dispatch(&s.context->context, &d.header);
     note_work();   // (AMD's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
@@ -437,7 +452,13 @@ uint64_t memory() {
     return s.context ? s.context->memory : 0;
 }
 
-const TemporalEngine kEngine{"AMD FSR 4", "FSR", start, prepare, evaluate, release, memory};
+/// Its context takes HDR colour (made for the game's native HDR): the chain gives it linear light, unclamped
+bool hdr() {
+    State& s = st();
+    return s.context && s.context->hdr;
+}
+
+const TemporalEngine kEngine{"AMD FSR 4", "FSR", start, prepare, evaluate, release, memory, hdr};
 
 }  // namespace
 

@@ -176,6 +176,16 @@ static int latest_tag(const char *have, char *tag, size_t cap) {
     return ok;
 }
 
+/* Portable metadata permits one constant launcher in the owning game folder, never a cwd/PATH lookup. */
+static int local_builder(const wchar_t *file, const wchar_t *dir, wchar_t *out, size_t cap) {
+    char local[8];
+    if (!read_value(file, "builder_local", local, sizeof local) || strcmp(local, "1")) return 0;
+    const int n = _snwprintf(out, cap, L"%ls\\hookshot.exe", dir);
+    if (n < 0 || (size_t)n >= cap) return 0;
+    const DWORD attributes = GetFileAttributesW(out);
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 void hos_update_check(void) {
     if (getenv("HOOKSHOT_NO_UPDATE_CHECK") && strcmp(getenv("HOOKSHOT_NO_UPDATE_CHECK"), "0")) return;
     wchar_t dir[MAX_PATH], file[MAX_PATH + 64];
@@ -196,12 +206,17 @@ void hos_update_check(void) {
     fprintf(stderr, "update: this folder is %s, the latest release is %s\n", have, tag);
     if (!strcmp(tag, have) || !strcmp(tag, skipped)) return;
     if (strchr(have, '-') && !nightly_version(have) && !newer_version(tag, have)) return;   /* (a release candidate: newer only) */
+    if (!nightly_version(have) && newer_version(have, tag)) return;   /* (a release or release candidate newer than the latest:
+        a test build of the next release, before it is out. "Update" would build the older one over it, 2026-11-11) */
 
     wchar_t wtag[128], whave[128], wbuilder[MAX_PATH], text[2048];
     MultiByteToWideChar(CP_UTF8, 0, tag, -1, wtag, 128);
     MultiByteToWideChar(CP_UTF8, 0, have, -1, whave, 128);
     _snwprintf(file, MAX_PATH + 64, L"%ls\\hookshot_version.txt", dir);
-    const int has_builder = read_value(file, "builder", builder, sizeof builder) &&
+    char local_mode[8];
+    const int portable = read_value(file, "builder_local", local_mode, sizeof local_mode) && !strcmp(local_mode, "1");
+    const int has_builder = portable ? local_builder(file, dir, wbuilder, MAX_PATH) :
+                            read_value(file, "builder", builder, sizeof builder) &&
                             MultiByteToWideChar(CP_UTF8, 0, builder, -1, wbuilder, MAX_PATH) > 0 &&
                             GetFileAttributesW(wbuilder) != INVALID_FILE_ATTRIBUTES;
     if (has_builder)
@@ -236,7 +251,7 @@ void hos_update_check(void) {
     char bargs[1024] = "";
     wchar_t wbargs[1024] = L"";
     _snwprintf(file, MAX_PATH + 64, L"%ls\\hookshot_version.txt", dir);
-    if (read_value(file, "builder_args", bargs, sizeof bargs)) MultiByteToWideChar(CP_UTF8, 0, bargs, -1, wbargs, 1024);
+    if (!portable && read_value(file, "builder_args", bargs, sizeof bargs)) MultiByteToWideChar(CP_UTF8, 0, bargs, -1, wbargs, 1024);
     wchar_t args[MAX_PATH + 1280], wdir[MAX_PATH];
     _snwprintf(args, MAX_PATH + 1280, L"%ls%ls--update \"%ls\" --tag \"%ls\"", wbargs, wbargs[0] ? L" " : L"", dir, wtag);
     wcsncpy(wdir, wbuilder, MAX_PATH);
@@ -263,6 +278,13 @@ void hos_update_check(void) {
 
 /* (the same offer as Windows, when the player started bin/hookshot itself. The launcher sets HOOKSHOT_NO_UPDATE_CHECK
    and asks in its own window. curl and zenity do the network and the question; without either, the game just starts) */
+
+/* "Skip this version" is kept with the saves, where they are (hos_main.c sets it first: $XDG_DATA_HOME/hookshot, or
+   --user's folder). It was written to user/ beside the game, as on Windows, where Linux keeps no saves any more: the
+   start's move of an old user/ folder (saves_dir) took the file for one, moved it to the saves' place and wrote
+   saves-moved.txt, so the next start asked again. Skipped again, the file was in both places, which the move reads as
+   saves it cannot move: the game then ran on the empty user/ beside it and showed no saves. */
+extern const char *hos_user_dir;
 
 static int read_value(const char *path, const char *name, char *out, size_t cap) {
     FILE *f = fopen(path, "rb");
@@ -356,8 +378,9 @@ void hos_update_check(void) {
     dir[n] = 0;
     snprintf(path, sizeof path, "%shookshot_version.txt", dir);
     if (!read_value(path, "version", have, sizeof have) || !safe_tag(have)) return;
-    snprintf(path, sizeof path, "%suser/hookshot_update_skip.txt", dir);
-    read_value(path, "skip", skipped, sizeof skipped);
+    char skip[MAX_PATH + 64];
+    snprintf(skip, sizeof skip, "%s/hookshot_update_skip.txt", hos_user_dir);
+    read_value(skip, "skip", skipped, sizeof skipped);
     if (!latest_tag(have, tag, sizeof tag)) {
         fprintf(stderr, "update: the latest release could not be asked for (offline?)\n");
         return;
@@ -365,6 +388,8 @@ void hos_update_check(void) {
     fprintf(stderr, "update: this folder is %s, the latest release is %s\n", have, tag);
     if (!strcmp(tag, have) || !strcmp(tag, skipped)) return;
     if (strchr(have, '-') && !nightly_version(have) && !newer_version(tag, have)) return;   /* (a release candidate: newer only) */
+    if (!nightly_version(have) && newer_version(have, tag)) return;   /* (a release or release candidate newer than the latest:
+        a test build of the next release, before it is out. "Update" would build the older one over it, 2026-11-11) */
     snprintf(path, sizeof path, "%shookshot_version.txt", dir);
     const int has_builder = installed_builder(builder, sizeof builder) ||
                             (read_value(path, "builder", builder, sizeof builder) && access(builder, X_OK) == 0);
@@ -381,10 +406,8 @@ void hos_update_check(void) {
     if (!fgets(answer, sizeof answer, pick)) answer[0] = 0;
     pclose(pick);
     if (!strncmp(answer, "Skip", 4)) {
-        snprintf(path, sizeof path, "%suser", dir);
-        mkdir(path, 0755);
-        snprintf(path, sizeof path, "%suser/hookshot_update_skip.txt", dir);
-        FILE *f = fopen(path, "wb");
+        mkdir(hos_user_dir, 0755);
+        FILE *f = fopen(skip, "wb");
         if (f) fprintf(f, "skip=%s\n", tag), fclose(f);
         return;
     }

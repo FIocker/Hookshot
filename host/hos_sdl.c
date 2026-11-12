@@ -22,6 +22,7 @@ static struct {
     void *PadOpen, *PadClose, *PadConnected, *PadsUpdate, *PadButton, *PadAxis, *PadName, *PadRumble;
     void *PadType, *PadEffect;   /* (optional: HD rumble, host/pad_sdl.c) */
     void *PadHasSensor, *PadSensorEnable, *PadSensorData;   /* (motion: optional, NULL in an SDL without them) */
+    void *PadVendor, *PadSteamHandle, *SetHintPriority;   /* (Steam's stand-in pads: optional, host/steam_pads.h) */
     void *GetGamepads, *GetGamepadID, *Free;   /* (SDL3) */
     void *NumJoysticks, *IsGameController, *DeviceInstanceID, *GetJoystick, *JoystickInstanceID;   /* (SDL2) */
 } f;
@@ -71,6 +72,11 @@ static int get_all(HMODULE m, int three) {
     *(FARPROC *)&f.PadHasSensor = GetProcAddress(m, three ? "SDL_GamepadHasSensor" : "SDL_GameControllerHasSensor");
     *(FARPROC *)&f.PadSensorEnable = GetProcAddress(m, three ? "SDL_SetGamepadSensorEnabled" : "SDL_GameControllerSetSensorEnabled");
     *(FARPROC *)&f.PadSensorData = GetProcAddress(m, three ? "SDL_GetGamepadSensorData" : "SDL_GameControllerGetSensorData");
+    /* (Steam's stand-in pads told apart from the real ones: SDL 2.30 on and SDL3 3.2 on; without them Steam's
+       controller ignore list stays as Steam set it) */
+    *(FARPROC *)&f.PadVendor = GetProcAddress(m, three ? "SDL_GetGamepadVendor" : "SDL_GameControllerGetVendor");
+    *(FARPROC *)&f.PadSteamHandle = GetProcAddress(m, three ? "SDL_GetGamepadSteamHandle" : "SDL_GameControllerGetSteamHandle");
+    *(FARPROC *)&f.SetHintPriority = GetProcAddress(m, "SDL_SetHintWithPriority");
     if (three) {
         GET(SetWindowPosition, "SDL_SetWindowPosition");
         GET(GetPrimaryDisplay, "SDL_GetPrimaryDisplay");
@@ -123,6 +129,13 @@ void hos_sdl_hint(const char *name, const char *value) {
     if (!hos_sdl_load()) return;
     if (version == 3) CALL(_Bool (*)(const char *, const char *), SetHint)(name, value);
     else CALL(int (*)(const char *, const char *), SetHint)(name, value);
+}
+/* (hookshot) a hint over the environment's own (SDL_HINT_OVERRIDE, 2 in both): a variable Steam sets for the games it
+   starts wins over SDL_SetHint. 0 when the SDL has no SDL_SetHintWithPriority */
+int hos_sdl_hint_override(const char *name, const char *value) {
+    if (!hos_sdl_load() || !f.SetHintPriority) return 0;
+    if (version == 3) return CALL(_Bool (*)(const char *, const char *, int), SetHintPriority)(name, value, 2);
+    return CALL(int (*)(const char *, const char *, int), SetHintPriority)(name, value, 2) != 0;
 }
 void hos_sdl_identity(const char *name, const char *app_id) {
     if (!hos_sdl_load()) return;
@@ -629,5 +642,12 @@ int hos_sdl_pad_sensor(void *pad, int type, float *data, int n) {
     if (!f.PadSensorData) return 0;
     return version == 3 ? CALL(_Bool (*)(void *, int, float *, int), PadSensorData)(pad, type, data, n)
                         : CALL(int (*)(void *, int, float *, int), PadSensorData)(pad, type, data, n) == 0;
+}
+/* (Steam's stand-in pads, host/steam_pads.h) whether the SDL tells them apart; a pad's USB vendor (0 unknown); its
+   Steam Input handle, not 0 for a Steam stand-in pad */
+int hos_sdl_knows_steam_pads(void) { return f.PadVendor && f.PadSteamHandle && f.SetHintPriority; }
+uint16_t hos_sdl_pad_vendor(void *pad) { return f.PadVendor ? CALL(uint16_t (*)(void *), PadVendor)(pad) : 0; }
+uint64_t hos_sdl_pad_steam_handle(void *pad) {
+    return f.PadSteamHandle ? CALL(uint64_t (*)(void *), PadSteamHandle)(pad) : 0;
 }
 #undef CALL

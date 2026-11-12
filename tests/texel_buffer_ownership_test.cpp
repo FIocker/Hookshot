@@ -56,6 +56,7 @@ struct Pool {
 Pool first_pool{0x1000, 0x2000, 0, 0, handle<VkBuffer>(1), {}, {}, 0x100000};
 Pool second_pool{0x2000, 0x3000, 0, 0, handle<VkBuffer>(2), {}, {}, 0x200000};
 std::mutex pools_mu;
+void note_in_place_read(bool = false) {}   // (the readback's part wait: tests/test_readback_part.py)
 Pool* pool_of(uint64_t guest, uint64_t) {
     lookups++;
     return guest < second_pool.lo ? &first_pool : &second_pool;
@@ -85,6 +86,7 @@ uint64_t st_retired_imports_freed = 0, st_retired_import_bytes_freed = 0;
 std::deque<std::map<uint64_t, Pool>::node_type> evicted_pools;
 void logf(const char*, ...) {}
 const char* getenv(const char*) { return nullptr; }   // (unrelated diagnostic toggle in reap_mirrors)
+bool env_on(const char* name) { const char* v = getenv(name); return v && !env_value_off(v); }   // (the switches through the stand-in)
 VkDeviceAddress vkGetBufferDeviceAddress(VkDevice, const VkBufferDeviceAddressInfo*) { return 0; }
 void destroy_buffer(VkBuffer, VmaAllocation) {}
 void vkDestroyBuffer(VkDevice, VkBuffer buffer, const VkAllocationCallbacks*) {
