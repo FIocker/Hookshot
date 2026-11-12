@@ -43,7 +43,11 @@ struct Texture {
     uint64_t gpu=0x1000;
     uint32_t width=64,height=32,depth=1,layers=4,levels=4,skip=0;
     int nvn_format=1; bool bc=false,astc=false,sparse=false,gpu_written=false,released=false,only_cleared=false;
+    float rs=1.0f;   // (Shadow resolution: a shadow map's image this many times the game's size; 1 here)
 } tex;
+''' + (ROOT / "gpu/vk/shadow_res.h").read_text(encoding="utf-8").replace("#pragma once", "") + r'''
+inline uint32_t image_width(const Texture* t) { return shadow_res::image_size(t->width, t->rs); }
+inline uint32_t image_height(const Texture* t) { return shadow_res::image_size(t->height, t->rs); }
 struct nvn_tex { uint64_t gpu=0x1000; };
 struct nvn_view { bool set_levels=false,set_layers=false; uint8_t base_level=0,nlevels=0; uint16_t min_layer=0,nlayers=0; };
 struct NVNcopyRegion { int32_t xoffset=0,yoffset=0,zoffset=0,width=0,height=0,depth=1; };

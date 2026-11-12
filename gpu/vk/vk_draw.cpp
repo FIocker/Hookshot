@@ -973,6 +973,8 @@ struct Targets {
     bool has_block_images = false;
     uint32_t width = 0, height = 0;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    float scale = 1.0f;   // Shadow resolution: the depth target's image over the game's size (its viewport, scissor
+                          // and clears are scaled by it; vk_texture.h Texture::rs)
 };
 
 /// (hookshot) The colour output types a program is translated for: each target's, by its format (Shader::AttributeType). The draw's,
@@ -3978,16 +3980,48 @@ Targets targets(NvnState& s) {
                 at.depth = tex, at.depth_view = view, at.depth_format = tex->format;
                 const uint32_t level = image_level(tex, view_level(v));
                 at.depth_level = level, at.depth_layer = v ? view_layer(v) : 0;
-                const uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+                const uint32_t w = std::max(1u, image_width(tex) >> level), h = std::max(1u, image_height(tex) >> level);
                 at.width = at.width ? std::min(at.width, w) : w;
                 at.height = at.height ? std::min(at.height, h) : h;
                 if (!at.n) at.samples = tex->samples;
+                // a shadow map made larger (Shadow resolution): a depth-only pass over it is the image's size,
+                // the game's rectangles scaled to it. With colour targets of the game's size it cannot be: it is drawn at the
+                // game's size, into the image's top-left corner, so whatever samples this depth afterwards reads the wrong
+                // region. shadow_res_refuse only keeps the next texture made at this size and format at the game's size; this
+                // one keeps its larger image. A logged limitation: OoT's shadow passes are depth-only, and this has not been seen
+                if (tex->rs != 1.0f && !at.n) {
+                    at.scale = tex->rs;
+                } else if (tex->rs != 1.0f) {
+                    shadow_res_refuse(tex);
+                    static int told;
+                    if (told++ < 4)
+                        logf("vk: shadow resolution: depth texture %#llx (%ux%u, made %ux%u) rendered with %d colour target(s): "
+                             "drawn at the game's size", (unsigned long long)tex->gpu, tex->width, tex->height, image_width(tex),
+                             image_height(tex), at.n);
+                }
             }
         }
     }
     targets_serial = s.rt_serial;
     cached_targets = at;
     return at;
+}
+
+/// The game's scissor 0 on targets of w x h (its whole area without one); scale: Shadow resolution's, the rectangle's edges
+/// moved with the larger image. The pass's and the clears' (vkCmdClearAttachments) alike
+VkRect2D scissor_rect(const NvnState& s, uint32_t w, uint32_t h, float scale) {
+    VkRect2D r{{0, 0}, {w, h}};
+    if (s.scissor[2] > 0 && s.scissor[3] > 0) {
+        int64_t a0 = s.scissor[0], b0 = s.scissor[1], a1 = (int64_t)s.scissor[0] + s.scissor[2], b1 = (int64_t)s.scissor[1] + s.scissor[3];
+        if (scale != 1.0f) {   // (to the nearest pixel: two rectangles that meet still meet)
+            a0 = shadow_res::edge(a0, scale), b0 = shadow_res::edge(b0, scale);
+            a1 = shadow_res::edge(a1, scale), b1 = shadow_res::edge(b1, scale);
+        }
+        const int64_t x0 = std::clamp<int64_t>(a0, 0, w), y0 = std::clamp<int64_t>(b0, 0, h);
+        const int64_t x1 = std::clamp<int64_t>(a1, 0, w), y1 = std::clamp<int64_t>(b1, 0, h);
+        r = {{(int32_t)x0, (int32_t)y0}, {(uint32_t)std::max<int64_t>(0, x1 - x0), (uint32_t)std::max<int64_t>(0, y1 - y0)}};
+    }
+    return r;
 }
 
 /// A draw with no target at all (a fragment shader that only writes storage): the pass is the viewport's area
@@ -4180,19 +4214,17 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
                     std::find(footprint.begin(), footprint.end(), cur_program->key) != footprint.end();
     // the viewport upside down (negative height): NVN's NDC has +y up, Vulkan's down
     float vx = s.viewport[0][0], vy = s.viewport[0][1], vw = s.viewport[0][2], vh = s.viewport[0][3];
+    if (at.scale != 1.0f) vx *= at.scale, vy *= at.scale, vw *= at.scale, vh *= at.scale;   // (Shadow resolution)
     if (vw == 0.0f && vh == 0.0f) vx = 0, vy = 0, vw = (float)at.width, vh = (float)at.height;
     d.vp = {vx, vy + vh, vw, -vh, std::clamp(s.depth_near, 0.0f, 1.0f), std::clamp(s.depth_far, 0.0f, 1.0f)};
-    d.sc = {{0, 0}, {at.width, at.height}};
-    if (s.scissor[2] > 0 && s.scissor[3] > 0) {
-        const int32_t x0 = std::max(0, s.scissor[0]), y0 = std::max(0, s.scissor[1]);
-        const int32_t x1 = std::min<int32_t>(s.scissor[0] + s.scissor[2], (int32_t)at.width);
-        const int32_t y1 = std::min<int32_t>(s.scissor[1] + s.scissor[3], (int32_t)at.height);
-        d.sc = {{x0, y0}, {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)}};
-    }
+    d.sc = scissor_rect(s, at.width, at.height, at.scale);
     std::memcpy(d.blend, s.blend_color, sizeof d.blend);
     for (int f = 0; f < 2; f++)
         d.sref[f] = s.stencil_ref[f] & 0xFF, d.scmp[f] = s.stencil_value_mask[f] & 0xFF, d.swm[f] = s.stencil_mask[f] & 0xFF;
     d.bias[0] = s.poly_offset[1], d.bias[1] = s.poly_offset[2], d.bias[2] = s.poly_offset[0];
+    // (Shadow resolution: the slope-scaled term is per pixel of depth slope, and a map made k times larger has 1/k the
+    // slope a pixel, so k times the factor keeps the bias the game asked for. Only a depth-only pass over such a map has a scale)
+    if (at.scale != 1.0f) d.bias[2] *= at.scale;
     d.bias_en = s.poly.offset_en != 0;
     {   // (hookshot) The characters' own shadow maps (square, depth only, 768 and less; 1e26755d projects them on the screen): their
         // stored depth is moved away from the light, or they shadow themselves whole: Link and the ferns black in the shade, while
@@ -4202,13 +4234,14 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
             units = 250000.0f, slope = 0.0f;
             if (const char* e = getenv("RX_VK_SHADOW_BIAS")) sscanf(e, "%f,%f", &units, &slope);
         }
-        if (units > 0 && at.n == 0 && at.width == at.height && at.width <= 768 && at.depth) {
+        const uint32_t gw = at.scale != 1.0f ? (uint32_t)(at.width / at.scale + 0.5f) : at.width;   // (the game's size)
+        if (units > 0 && at.n == 0 && at.width == at.height && gw <= 768 && at.depth) {
             d.bias[0] += units, d.bias[2] += slope;
             d.bias_en = true;
         }
         // (amd-fix, 11-07) the sun's shadow cascades (square, depth only, past 768): RX_VK_CASCADE_BIAS=<units>,<slope> added;
         // RX_VK_LOG_CASCADE_BIAS=1: what the game asks for them
-        if (at.n == 0 && at.width == at.height && at.width > 768 && at.depth) {
+        if (at.n == 0 && at.width == at.height && gw > 768 && at.depth) {
             static float cu = 0, cs = 0;
             static const bool parsed = [] {
                 if (const char* e = getenv("RX_VK_CASCADE_BIAS")) sscanf(e, "%f,%f", &cu, &cs);
@@ -4346,16 +4379,6 @@ void make_dummies() {
 
 // ---- clears: between the draws of a pass, cut by scissor 0 (as deko3d programs every clear), a channel mask with
 // a full-screen triangle (vkCmdClearAttachments has no write mask; TOTK's maxwell.md 1.3) ----
-VkRect2D clear_rect(const NvnState& s, uint32_t w, uint32_t h) {
-    VkRect2D r{{0, 0}, {w, h}};
-    if (s.scissor[2] > 0 && s.scissor[3] > 0) {
-        const int32_t x0 = std::clamp(s.scissor[0], 0, (int32_t)w), y0 = std::clamp(s.scissor[1], 0, (int32_t)h);
-        const int32_t x1 = std::clamp(s.scissor[0] + s.scissor[2], 0, (int32_t)w);
-        const int32_t y1 = std::clamp(s.scissor[1] + s.scissor[3], 0, (int32_t)h);
-        r = {{x0, y0}, {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)}};
-    }
-    return r;
-}
 
 /// The SPIR-V of a module with its Location 0 output moved to location (masked clears of target n)
 std::vector<uint32_t> spirv_location(const uint32_t* w, size_t n, uint32_t location) {
@@ -4593,7 +4616,7 @@ void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float
     clear_after_draws(cmd);
     begin_pass(cmd, at);
     const uint32_t lw = at.width, lh = at.height;
-    const VkRect2D rect = clear_rect(s, lw, lh);
+    const VkRect2D rect = scissor_rect(s, lw, lh, at.scale);
     if (!rect.extent.width || !rect.extent.height) return;
     st_clears++, pass().clears++;
     if (mask == 0xF) {
@@ -4638,7 +4661,7 @@ void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool dep
     }
     clear_after_draws(cmd);
     begin_pass(cmd, at);
-    const VkRect2D rect = clear_rect(s, at.width, at.height);
+    const VkRect2D rect = scissor_rect(s, at.width, at.height, at.scale);
     if (!rect.extent.width || !rect.extent.height) return;
     VkClearAttachment ca{};
     ca.aspectMask = aspect;

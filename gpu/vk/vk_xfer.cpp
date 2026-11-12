@@ -212,6 +212,7 @@ void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to
     }
     Sub s;
     if (!resolve(p.tex, &p.view, p.has_view != 0, p.r, s)) return;
+    if (s.tex->rs != 1.0f) warn(11, "copy between a buffer and a shadow map made larger (Shadow resolution): its top-left corner");
     uint64_t size = 0;
     VkBufferImageCopy c{};
     BufferRef span;
@@ -255,6 +256,27 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
                  d.w, d.h, p.flags);
     }
     log_big_copy("texture", d.tex, d.level, d.layer, d.x, d.y, d.w, d.h, s.tex->gpu);
+    // a shadow map made larger (Shadow resolution, vk_texture.h Texture::rs): its side of the copy in the image's
+    // texels. Two such alike copy as they are; otherwise a blit scales, where the depth format can be blitted
+    const auto upscaled = [](Sub& x) {
+        if (x.tex->rs == 1.0f) return;
+        const int64_t x1 = shadow_res::edge((int64_t)x.x + x.w, x.tex->rs), y1 = shadow_res::edge((int64_t)x.y + x.h, x.tex->rs);
+        x.x = (int32_t)shadow_res::edge(x.x, x.tex->rs), x.y = (int32_t)shadow_res::edge(x.y, x.tex->rs);
+        x.w = (uint32_t)std::max<int64_t>(0, x1 - x.x), x.h = (uint32_t)std::max<int64_t>(0, y1 - x.y);
+    };
+    if (s.tex->rs != 1.0f || d.tex->rs != 1.0f) {
+        upscaled(s), upscaled(d);
+        if ((s.w != d.w || s.h != d.h) && !(s.tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+            VkFormatProperties fs{}, fd{};
+            vkGetPhysicalDeviceFormatProperties(dev.physical, s.tex->format, &fs);
+            vkGetPhysicalDeviceFormatProperties(dev.physical, d.tex->format, &fd);
+            if (!(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
+                !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+                warn(12, "copy into or out of a shadow map made larger (Shadow resolution) the GPU cannot scale: skipped");
+                return;
+            }
+        }
+    }
     if (s.tex == d.tex && s.level == d.level && s.layer == d.layer) {
         warn(6, "texture copy within one subresource: skipped");
         return;
@@ -324,8 +346,14 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
 void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
     Sub s;
     if (!resolve(p.tex, &p.view, p.has_view != 0, p.r, s)) return;
-    const uint32_t lw = std::max(1u, s.tex->width >> s.level), lh = std::max(1u, s.tex->height >> s.level);
+    uint32_t lw = std::max(1u, s.tex->width >> s.level), lh = std::max(1u, s.tex->height >> s.level);
     const bool whole = !s.x && !s.y && s.w == lw && s.h == lh;
+    if (s.tex->rs != 1.0f && !whole) {   // (a shadow map made larger, Shadow resolution: the region in its image's texels)
+        const int64_t x1 = shadow_res::edge((int64_t)s.x + s.w, s.tex->rs), y1 = shadow_res::edge((int64_t)s.y + s.h, s.tex->rs);
+        s.x = (int32_t)shadow_res::edge(s.x, s.tex->rs), s.y = (int32_t)shadow_res::edge(s.y, s.tex->rs);
+        s.w = (uint32_t)std::max<int64_t>(0, x1 - s.x), s.h = (uint32_t)std::max<int64_t>(0, y1 - s.y);
+        lw = image_width(s.tex), lh = image_height(s.tex);
+    }
     if ((p.mask & 0xf) != 0xf && (s.tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) warn(8, "texture clear with a channel mask: cleared whole");
     end_pass(cmd);
     GprofSpan gp(cmd, "xfer clear texture (with its barriers)");

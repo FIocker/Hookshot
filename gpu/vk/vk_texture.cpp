@@ -1905,6 +1905,22 @@ bool low_vram_texture_mips() {
     return !disabled && small && opts.preset == 1;
 }
 
+// Shadow resolution: the sizes and formats of depth textures made larger that were then rendered with colour targets
+std::mutex shadow_res_mu;
+std::unordered_set<uint64_t> shadow_res_no;
+uint64_t shadow_res_key(uint32_t w, uint32_t h, int nvn_format) { return (uint64_t)w << 40 | (uint64_t)h << 16 | (uint32_t)nvn_format; }
+bool shadow_res_refused(uint32_t w, uint32_t h, int nvn_format) {
+    std::lock_guard lk(shadow_res_mu);
+    return shadow_res_no.count(shadow_res_key(w, h, nvn_format)) != 0;
+}
+}  // namespace
+void shadow_res_refuse(const Texture* t) {
+    std::lock_guard lk(shadow_res_mu);
+    if (shadow_res_no.insert(shadow_res_key(t->width, t->height, t->nvn_format)).second)
+        logf("vk: shadow resolution: depth %ux%u (NVN %#x) rendered with colour targets: not a shadow map, kept at the game's size "
+             "when made again", t->width, t->height, t->nvn_format);
+}
+namespace {
 Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw, int bh, int bpb, bool as_target) {
     PROF_EXACT();   // (texture_get's slow path: PROF_TEXGET samples the rest)
     auto tex = std::make_unique<Texture>();
@@ -1990,6 +2006,30 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         return nullptr;
     }
     x.samples = d.samples > 1 ? (VkSampleCountFlagBits)d.samples : VK_SAMPLE_COUNT_1_BIT;
+    {   // Shadow resolution (the Insert menu's Graphics tab, as at the start): the shadow maps' images made larger
+        // than the game's, and the passes that render them scaled to match (vk_draw.cpp targets: the viewport, scissor and
+        // clears). OoT's shadow maps are square depth targets of one level: the characters' (768 and less) and the sun's
+        // cascades (1600 x 1600 x 3 in D16 docked). The game samples them by normalized coordinates, so it reads the finer
+        // map as it is. A size a multiple of 32 (not the scene's odd dynamic sizes); a size once seen rendered with colour
+        // targets is not a shadow map and stays the game's from then on (shadow_res_refuse, vk_draw.cpp targets)
+        // Each side 8192 at most, and the image 1 GB at most (shadow_res.h)
+        const float want = shadow_resolution_factor();
+        if (want > 1.0f && x.type == VK_IMAGE_TYPE_2D &&
+            shadow_res::qualifies(depth && (x.aspect & VK_IMAGE_ASPECT_DEPTH_BIT),
+                                  d.target == NVN_TEXTURE_TARGET_2D || d.target == NVN_TEXTURE_TARGET_2D_ARRAY,
+                                  (uint32_t)x.samples, x.levels, x.skip || x.sparse, x.width, x.height) &&
+            !shadow_res_refused(x.width, x.height, d.format)) {
+            const uint32_t side = shadow_res::side(x.width, std::max(1u, x.layers), (uint32_t)std::max(2, bpb), want,
+                                                   std::min<uint32_t>(8192u, dev.props.limits.maxImageDimension2D));
+            if (side > x.width) {
+                x.rs = (float)side / (float)x.width;
+                static int told;
+                if (told++ < 16)
+                    logf("vk: shadow resolution: texture %#llx %ux%u x%u (NVN %#x) made %ux%u", (unsigned long long)t->gpu,
+                         x.width, x.height, x.layers, d.format, side, side);
+            }
+        }
+    }
     {   // (decoded ASTC as BC3: 2D, at most the scratch's size; from blocks of 6 x 6 texels up (2.25 bits a texel or
         // less: BC3's 8 keep what they have) from 2 MB as RGBA8 (RX_VK_ASTC_BC_MB), the finer ones (UI, characters)
         // only from 64 MB)
@@ -2111,7 +2151,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     ci.flags = flags;
     ci.imageType = x.type;
     ci.format = x.format;
-    ci.extent = {x.width, x.height, x.depth};
+    ci.extent = {image_width(&x), image_height(&x), x.depth};   // (a shadow map's larger image, above)
     ci.mipLevels = x.levels;
     ci.arrayLayers = x.layers;
     ci.samples = x.samples;
@@ -2182,6 +2222,8 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     uint64_t px = 0;
     for (uint32_t l = 0; l < x.levels; l++)
         px += texture_level_units(x.width >> l, x.height >> l, x.depth >> l, astc_blocks ? (uint32_t)bw : 1u, astc_blocks ? (uint32_t)bh : 1u);
+    // (a shadow map made larger, Shadow resolution: one level, its image's texels, not the game's; shadow_res.h)
+    if (x.rs != 1.0f) px = (uint64_t)image_width(&x) * image_height(&x) * std::max(1u, x.depth);
     const uint32_t texel = x.bc || is_bc(x.format) ? 1 : astc ? 4 : std::max(1, from ? (from == 3 ? 4 : from == 6 ? 8 : 16) : bpb);
     x.bytes = x.sparse ? 0 : px * x.layers * texel * x.samples;   // (a sparse image's: as its layers are bound)
     // (the budget counts what the allocator gave it: the texels' 8% short of that over a scene's 2000 textures, 3228 MB counted for 3504
@@ -3957,7 +3999,7 @@ void compact_step(uint64_t completed) {
             ci.flags = t->create_flags;
             ci.imageType = t->type;
             ci.format = t->format;
-            ci.extent = {t->width, t->height, t->depth};
+            ci.extent = {image_width(t), image_height(t), t->depth};   // (a shadow map made larger keeps its size: Shadow resolution)
             ci.mipLevels = t->levels;
             ci.arrayLayers = t->layers;
             ci.samples = t->samples;
@@ -3996,7 +4038,7 @@ void compact_step(uint64_t completed) {
         for (uint32_t l = 0; l < t->levels; l++) {
             VkImageCopy r{};
             r.srcSubresource = r.dstSubresource = {t->aspect, l, 0, t->layers};
-            r.extent = {std::max(1u, t->width >> l), std::max(1u, t->height >> l), std::max(1u, t->depth >> l)};
+            r.extent = {std::max(1u, image_width(t) >> l), std::max(1u, image_height(t) >> l), std::max(1u, t->depth >> l)};
             regions.push_back(r);
         }
         vkCmdCopyImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)regions.size(), regions.data());
