@@ -2146,8 +2146,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
-    if (loads.AnyComponent(IR::Attribute::PositionX) ||
-        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth) {
+    if (loads.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth) {   // (loads has passthrough's in it)
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;

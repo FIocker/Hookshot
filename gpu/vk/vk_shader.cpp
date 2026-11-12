@@ -264,7 +264,8 @@ Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area) {
         }
     }
     Shader::Ampere::native_matrix_multiply = dev.native_mma && !graphics && native_key;
-    {   // (super build) RX_VK_LOWER_SKIP=<key prefix,...>: those programs left unlowered, as if they did not lower (a bisection)
+    {   // RX_VK_LOWER_SKIP=<key prefix,...>: those programs left unlowered, as if they did not lower (a bisection). It is in
+        // translator_stamp, so a cache made with it set is kept apart from one made without
         static const std::string skip = getenv("RX_VK_LOWER_SKIP") ? getenv("RX_VK_LOWER_SKIP") : "";
         if (!skip.empty()) {
             char hex[24];
@@ -1210,7 +1211,7 @@ uint64_t translator_stamp() {
     // the programs already cached. tests/test_program_stamp_knobs.py checks the translator's switches against this list)
     for (char** e = _environ; e && *e; e++)
         for (const char* pre : {"RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_MARKERS",
-                                "RX_VK_NO_CBUF_LOAD_RULE", "RX_VK_PTR_SPLIT_FALLBACK", "RX_VK_ALL_GLOBAL_PROGS", "RX_VK_NO_EXTREGS", "RX_VK_NO_DRAW_PARAMS", "RX_VK_MISS_LOG", "RX_VK_BLOCK_PROBE", "EDEN_"})
+                                "RX_VK_NO_CBUF_LOAD_RULE", "RX_VK_PTR_SPLIT_FALLBACK", "RX_VK_ALL_GLOBAL_PROGS", "RX_VK_NO_EXTREGS", "RX_VK_NO_DRAW_PARAMS", "RX_VK_MISS_LOG", "RX_VK_BLOCK_PROBE", "RX_VK_LOWER_SKIP", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
     return h;
 }
