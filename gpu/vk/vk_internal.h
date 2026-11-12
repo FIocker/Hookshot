@@ -189,15 +189,31 @@ extern std::atomic<bool> par_active;
 extern std::atomic<int64_t> par_lock_wait_ns, par_locks;   // (contention: the time threads waited for it)
 std::recursive_mutex& par_mutex();
 int64_t par_now_ns();
+/// (hookshot) Which site took the lock, and how long it waited there. The report says the threads
+/// take this lock hundreds of times per command buffer and wait milliseconds on it, which is why
+/// parallel replay is slower than the serial path -- but "739 times somewhere" cannot be acted on.
+/// Counted by file and line, with no call site changed, so the next question (which of the
+/// seventeen sites) has an answer. Free when parallel replay is off, because nothing below runs.
+void par_lock_seen(const char* file, int line, int64_t waited_ns);
+/// The sites that took it most since the last report, worst first; logged with the parallel line.
+void par_sites_report();
+
 struct ParLock {
     bool on;
-    explicit ParLock(bool want = true) : on(want && par_active.load(std::memory_order_relaxed)) {
+    explicit ParLock(bool want = true, const char* file = __builtin_FILE(),
+                     int line = __builtin_LINE())
+        : on(want && par_active.load(std::memory_order_relaxed)) {
         if (!on) return;
         par_locks.fetch_add(1, std::memory_order_relaxed);
-        if (par_mutex().try_lock()) return;
+        if (par_mutex().try_lock()) {
+            par_lock_seen(file, line, 0);
+            return;
+        }
         const int64_t t0 = par_now_ns();
         par_mutex().lock();
-        par_lock_wait_ns.fetch_add(par_now_ns() - t0, std::memory_order_relaxed);
+        const int64_t waited = par_now_ns() - t0;
+        par_lock_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+        par_lock_seen(file, line, waited);
     }
     ~ParLock() {
         if (on) par_mutex().unlock();
@@ -205,6 +221,9 @@ struct ParLock {
     ParLock(const ParLock&) = delete;
     ParLock& operator=(const ParLock&) = delete;
 };
+/// (diagnostics) Why bindings had to take ParLock in the pool lookup, and reset: a written binding,
+/// a thread-cache miss, or the mirror state. Each wants a different fix, so they are counted apart.
+void memory_pool_lock_reasons(int64_t* written, int64_t* cache_miss, int64_t* mirror);
 void memory_pool_created(uint64_t gpu, uint64_t size);
 /// Whether guest memory in [lo, hi) is in an imported pool, live or retired (the GPU may read or write it)
 int memory_guest_imported(uint64_t lo, uint64_t hi);

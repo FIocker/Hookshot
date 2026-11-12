@@ -3528,13 +3528,30 @@ void texture_written(Texture* tex, const char* why) {
 }
 
 
+/// (hookshot, diagnostics) Why the quick path gave up, counted. It is the busiest ParLock site in
+/// the renderer (352 locks a command buffer under parallel replay), and "it misses" is not a thing
+/// anyone can act on -- whether it is the upload check or the once-an-epoch check decides whether
+/// there is anything to win here at all. Read by texture_touch_misses().
+std::atomic<int64_t> touch_miss_upload{0}, touch_miss_epoch{0}, touch_miss_unuploaded{0};
+
 bool texture_touch_quick(Texture* tex, bool for_sampling) {
     tex->last_frame = frame_no;   // (the same values whichever thread stores them)
     tex->last_value = rec_value;
     if (!for_sampling) return true;
     if (tex->gpu_written && !tex->released && !tex->only_cleared) return true;
-    if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) return false;
-    return tex->uploaded && tex->checked_epoch == epoch;
+    if (tex->upload_value == rec_value && tex->upload_seg > tl_seg) {
+        touch_miss_upload.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (tex->uploaded && tex->checked_epoch == epoch) return true;
+    (tex->uploaded ? touch_miss_epoch : touch_miss_unuploaded).fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+void texture_touch_misses(int64_t* upload, int64_t* epoch_out, int64_t* unuploaded) {
+    *upload = touch_miss_upload.exchange(0, std::memory_order_relaxed);
+    *epoch_out = touch_miss_epoch.exchange(0, std::memory_order_relaxed);
+    *unuploaded = touch_miss_unuploaded.exchange(0, std::memory_order_relaxed);
 }
 void texture_gpu_wrote(uint64_t gpu, uint64_t size) {
     if (!gpu || !size) return;

@@ -1679,6 +1679,16 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     if (++timed % 240 == 0) {
         logf("vk: parallel replay, a command buffer: dry pass %.2f ms, segments %.2f ms (%.1f of them), lock taken %.0f "
              "times, waited for %.2f ms (all threads)", dry_ms / 240, seg_ms / 240, segs_n / 240, locks_n / 240, wait_ms / 240);
+        par_sites_report();
+        {   // (hookshot) why the two busiest sites had to take it, which is what decides the fix
+            int64_t w = 0, cm = 0, mi = 0, tu = 0, te = 0, tun = 0;
+            memory_pool_lock_reasons(&w, &cm, &mi);
+            texture_touch_misses(&tu, &te, &tun);
+            logf("vk:   pool lock: %lld written, %lld cache miss, %lld mirror; texture touch: %lld upload, "
+                 "%lld epoch, %lld not uploaded (per command buffer)",
+                 (long long)(w / 240), (long long)(cm / 240), (long long)(mi / 240), (long long)(tu / 240),
+                 (long long)(te / 240), (long long)(tun / 240));
+        }
         dry_ms = seg_ms = segs_n = wait_ms = locks_n = 0;
     }
     // what follows, after them all (the uniform updates are written to guest memory at the submission's end)
@@ -5028,6 +5038,39 @@ void fill_replay_table(MkwVkRenderer& t) {
 
 std::atomic<bool> par_active{false};
 std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
+
+/// (hookshot) Per-site lock counts, for the report below. A plain array under the same mutex the
+/// caller already holds: this is only reached while the lock is taken, so it needs no lock of its
+/// own, and parallel replay is off by default so it costs nothing in a normal run.
+struct ParSite {
+    const char* file = nullptr;
+    int line = 0;
+    int64_t taken = 0, waited_ns = 0;
+};
+ParSite par_sites[64];
+void par_lock_seen(const char* file, int line, int64_t waited_ns) {
+    for (ParSite& s : par_sites) {
+        if (s.file == nullptr) { s.file = file, s.line = line; }
+        else if (s.file != file || s.line != line) continue;
+        s.taken++, s.waited_ns += waited_ns;
+        return;
+    }
+}
+
+/// The sites that took it most since the last report, worst first.
+void par_sites_report() {
+    ParSite* order[64];
+    int n = 0;
+    for (ParSite& s : par_sites)
+        if (s.file && s.taken) order[n++] = &s;
+    std::sort(order, order + n, [](const ParSite* a, const ParSite* b) { return a->taken > b->taken; });
+    for (int i = 0; i < n && i < 6; i++) {
+        const char* slash = strrchr(order[i]->file, '/');
+        logf("vk:   lock %s:%d taken %lld times, waited %.2f ms", slash ? slash + 1 : order[i]->file,
+             order[i]->line, (long long)order[i]->taken, order[i]->waited_ns / 1e6);
+    }
+    for (ParSite& s : par_sites) s.taken = 0, s.waited_ns = 0;
+}
 std::recursive_mutex& par_mutex() {
     return par_mu;
 }
