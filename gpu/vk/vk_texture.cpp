@@ -1172,6 +1172,16 @@ bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     default: return false;
     }
     if (!unswizzle_ready()) return false;
+    // (hookshot) Only from a pool already imported: an import made here, for one upload, took 22-25 ms on the replay
+    // thread (the driver locks the pages): three of them when the camera turns to the Deku Tree, a 60 ms hitch. The CPU
+    // path (several threads from 4 MB) does a 15 MB level in a few ms. RX_VK_UNSWIZZLE_IMPORT=1: import as before
+    static const bool may_import = env_on("RX_VK_UNSWIZZLE_IMPORT");
+    if (!may_import) {   // (a virtual pool's address above 1 TB: its guest address, as gpu_buffer translates it)
+        uint64_t avail = 0;
+        if (!host->gpu_ptr(tex.gpu, &avail) || avail < total) return false;
+        const uint64_t guest = tex.gpu < (1ull << 40) ? tex.gpu : host->gpu_guest(tex.gpu);
+        if (!memory_guest_contained(guest, guest + total)) return false;
+    }
     const BufferRef src = gpu_buffer(tex.gpu, total);
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 16);
     if (!src || (src.offset % align)) return false;
@@ -1607,7 +1617,9 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                     // course maps the title loads at each scene change, 6 of 349 MB, took ~100 ms each on one. Their
                     // storage is sparse: each thread gathers its own rows, 8 MB at a time, rather than all of it
                     // being copied first (a 349 MB scratch beside the 349 MB staged))
-                    const uint32_t nthreads = block_bytes >= (16u << 20) && g.td == 1 && !g.tile_d
+                    // (hookshot: from 4 MB, not 16: the scene-size targets uploaded when the camera turns to the Deku Tree,
+                    // 2779 x 1318 RGBA8 = 15 MB, took ~20 ms each on one thread, three in one frame: a 50 ms hitch)
+                    const uint32_t nthreads = block_bytes >= (4u << 20) && g.td == 1 && !g.tile_d
                                                   ? std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u) : 1u;
                     uint64_t avail = 0;
                     const uint8_t* direct = host->gpu_ptr(tex.gpu + from, &avail);

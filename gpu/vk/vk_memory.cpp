@@ -2851,6 +2851,15 @@ void memory_pool_created(uint64_t gpu, uint64_t size) {
     bg_cv.notify_one();
 }
 
+// (hookshot) Whether one imported pool holds all of [lo, hi): a lookup there imports nothing (vk_texture.cpp
+// upload_unswizzle_gpu asks before it reaches for one)
+int memory_guest_contained(uint64_t lo, uint64_t hi) {
+    std::lock_guard lk(pools_mu);
+    auto it = imported.upper_bound(lo);   // (pools by lo: the last one starting at or below lo)
+    if (it == imported.begin()) return 0;
+    --it;
+    return it->second.lo <= lo && it->second.hi >= hi ? 1 : 0;
+}
 int memory_guest_imported(uint64_t lo, uint64_t hi) {
     std::lock_guard lk(pools_mu);
     auto it = imported.upper_bound(hi);   // (pools by lo: those starting below hi, the last ones checked first)
