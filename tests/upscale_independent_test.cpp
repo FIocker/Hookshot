@@ -42,7 +42,7 @@ struct Layers { int aspect = 0, level = 0, first = 0, count = 0; };
 struct VkImageBlit { Layers srcSubresource, dstSubresource; Offset srcOffsets[2], dstOffsets[2]; };
 struct Extent { uint32_t width = 0, height = 0, depth = 0; };
 struct VkImageCopy { Layers srcSubresource; Offset srcOffset; Layers dstSubresource; Offset dstOffset; Extent extent; };
-struct { int upscale = 0, sharpness = 0, framegen = 0; } opts;
+struct { int upscale = 0, sharpness = 0, framegen = 0, sharpen_method = 0; } opts;
 struct SpyMutex {
     bool held = false;
     void lock() { CHECK(!held); held = true; }
@@ -64,7 +64,7 @@ uint32_t made_w = 0, made_h = 0, dispatched_w = 0, dispatched_h = 0;
 int made_usage = 0, made_format = 0, dispatched_mode = -1;
 uint64_t dispatched_pipe = 0;
 float dispatched_sharp = -1, dispatched_x0 = -1, dispatched_x1 = -1;
-int dispatched_side = -1;
+int dispatched_side = -1, dispatched_method = -1;
 VkImageView sampled_view = 0;
 VkImageBlit last_blit;
 VkImageCopy last_copy;
@@ -72,7 +72,7 @@ VkImageCopy last_copy;
 bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_list<int> types, uint32_t push) {
     const bool pq = code == FG_SCALE_PQ_COMP_SPV;
     CHECK((pq ? bytes == sizeof FG_SCALE_PQ_COMP_SPV : code == FG_SCALE_COMP_SPV && bytes == sizeof FG_SCALE_COMP_SPV));
-    CHECK(types.size() == 3 && push == 20);
+    CHECK(types.size() == 3 && push == 24);
     CHECK(*types.begin() == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && *(types.begin() + 1) == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
     const bool fail = pq ? pq_pipe_fail : pipe_fail;
     ++pipe_calls; p.set = 1; p.layout = 2; p.pipe = fail ? 0 : pq ? 5 : 3; return !fail;
@@ -111,13 +111,13 @@ void vkCmdCopyImage(int, VkImage src, int, VkImage dst, int, int count, const Vk
 }
 void pass(int, const Pipe& p, std::initializer_list<std::pair<VkImageView, VkSampler>> b,
           uint32_t w, uint32_t h, const void* data, uint32_t bytes) {
-    CHECK((p.pipe == 3 || p.pipe == 5) && b.size() == 3 && b.begin()->first && b.begin()->second == 4 && bytes == 20);
+    CHECK((p.pipe == 3 || p.pipe == 5) && b.size() == 3 && b.begin()->first && b.begin()->second == 4 && bytes == 24);
     CHECK((b.begin() + 2)->first && (b.begin() + 2)->second == 4);
     CHECK((b.begin() + 1)->first && !(b.begin() + 1)->second);
-    struct PC { int mode; float sharp; float x0, x1; int side; } pc;
+    struct PC { int mode; float sharp; float x0, x1; int side; int method; } pc;
     std::memcpy(&pc, data, sizeof pc);
     ++dispatches; dispatched_mode = pc.mode; dispatched_sharp = pc.sharp;
-    dispatched_side = pc.side; dispatched_x0 = pc.x0; dispatched_x1 = pc.x1;
+    dispatched_side = pc.side; dispatched_x0 = pc.x0; dispatched_x1 = pc.x1; dispatched_method = pc.method;
     dispatched_w = w; dispatched_h = h; sampled_view = b.begin()->first; dispatched_pipe = p.pipe;
 }
 void logf(const char*, ...) { CHECK(dispatches > 0); ++logs; }
@@ -145,7 +145,7 @@ int main() {
         CHECK(!framegen_on() && !fg.init && !fg.thread_started);
         CHECK(draw()); // original FG-off implementation returns null here
         CHECK(pipe_calls == 1 && sampler_calls == 1 && dispatches == 1 && image_calls == 1);
-        CHECK(dispatched_mode == mode && dispatched_sharp == (mode ? 0.0f : 0.37f));
+        CHECK(dispatched_mode == mode && dispatched_sharp == (mode ? 0.0f : 0.37f) && dispatched_method == 0);
         CHECK(dispatched_w == 2560 && dispatched_h == 1440 && sampled_view == 12);
         CHECK(made_usage == (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT));   // (sampled: the HDR pass reads it)
         CHECK(draw()); CHECK(pipe_calls == 1 && sampler_calls == 1 && image_calls == 1);
@@ -153,6 +153,10 @@ int main() {
         opts.upscale = opts.sharpness = 0; CHECK(!draw());
         CHECK(dispatches == 2 && image_calls == 1 && pipe_calls == 1);
     }
+    // (the Sharpening method row: AMD CAS is pushed as method 1, Gentle as 0)
+    reset(); opts.upscale = 1; opts.sharpness = 50; opts.sharpen_method = 1; CHECK(draw());
+    CHECK(dispatches == 1 && dispatched_method == 1 && dispatched_sharp == 0.5f);
+    opts.sharpen_method = 0; CHECK(draw()); CHECK(dispatches == 2 && dispatched_method == 0);
     // (ultrawide's menu sides alone run the pass, with the plain copy, and push the middle 16:9's edges)
     reset(); wide_now = WideSides{0.25f, 2}; CHECK(draw());
     CHECK(dispatches == 1 && dispatched_mode == 0 && dispatched_sharp == 0.0f);

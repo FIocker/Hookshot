@@ -87,6 +87,12 @@ static float min(float a, float b) { return std::min(a, b); }
 static float max(float a, float b) { return std::max(a, b); }
 static float clamp(float v, float lo, float hi) { return std::min(std::max(v, lo), hi); }
 static vec3 clamp(vec3 v, vec3 lo, vec3 hi) { return min(max(v, lo), hi); }
+// (and what cas() uses besides)
+static vec3 operator*(vec3 a, float b) { return a * vec3(b); }
+static vec3& operator+=(vec3& a, vec3 b) { return a = a + b; }
+static vec3 clamp(vec3 v, float lo, float hi) { return clamp(v, vec3(lo), vec3(hi)); }
+static vec3 sqrt(vec3 v) { return {std::sqrt(v.r), std::sqrt(v.g), std::sqrt(v.b)}; }
+static float mix(float a, float b, float t) { return a + (b - a) * t; }
 '''
 
 FIXTURE = r'''
@@ -127,6 +133,31 @@ int main() {
         last = o.r;
     }
     CHECK(last - edge(0.6f) > 0.01f);   // (a visible step, not a rounding)
+    // AMD CAS: finite and inside 0..1 for any neighbourhood, the picture as it is at 0 (the lobe fades in over the first step)
+    for (int i = 0; i < 200000; i++) {
+        const vec3 a = rnd3(), b = rnd3(), c = rnd3(), d = rnd3(), e = rnd3(), f = rnd3(), g = rnd3(), h = rnd3(), k = rnd3();
+        for (float amt : amounts) {
+            const vec3 o = cas(a, b, c, d, e, f, g, h, k, amt);
+            for (int j = 0; j < 3; j++) {
+                CHECK(std::isfinite(ch(o, j)) && ch(o, j) >= 0.0f && ch(o, j) <= 1.0f);
+                if (amt == 0.0f) CHECK(std::fabs(ch(o, j) - ch(e, j)) <= 1e-6f);
+            }
+        }
+    }
+    // a flat neighbourhood (light, black, white) stays as it is at full strength
+    for (float v : {0.0f, 0.5f, 1.0f}) {
+        const vec3 x(v), o = cas(x, x, x, x, x, x, x, x, x, 1.0f);
+        CHECK(std::fabs(o.r - v) <= 1e-6f && std::fabs(o.g - v) <= 1e-6f && std::fabs(o.b - v) <= 1e-6f);
+    }
+    // a blurred edge gets steeper as the setting rises
+    float cas_last = edge(0.6f);
+    for (float amt : {0.1f, 0.5f, 1.0f}) {
+        const vec3 lft(edge(-0.4f)), mid(edge(0.6f)), rgt(edge(1.6f));
+        const vec3 o = cas(lft, mid, rgt, lft, mid, rgt, lft, mid, rgt, amt);
+        CHECK(o.r > cas_last);
+        cas_last = o.r;
+    }
+    std::printf("PASS: cas() is the picture at 0, stays finite and inside 0..1, keeps flat areas, and steepens edges with the setting\n");
     std::printf("PASS: sharpen() is the picture at 0, stays inside its neighbourhood and 0..1, and steepens edges with the setting\n");
 }
 '''
@@ -175,7 +206,8 @@ def main():
             raise SystemExit("missing the neighbour at %s" % tap)
     lobe = re.search(r"const float kMaxLobe = [^;]*;", text).group(0)
     fn = block(text, "vec3 sharpen(")
-    fixture = SHIM + lobe.replace("const float", "static const float") + "\nstatic " + fn + FIXTURE
+    fixture = (SHIM + lobe.replace("const float", "static const float") + "\nstatic " + fn + "\nstatic " + block(text, "vec3 cas(") +
+               FIXTURE)
     with tempfile.TemporaryDirectory(prefix="fg-sharpen-") as tmp:
         cpp = Path(tmp) / "fixture.cpp"
         exe = Path(tmp) / "fixture"

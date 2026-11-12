@@ -17,7 +17,8 @@ const float kSteps = 255.0;
 // (side 1) or black (side 2), with a short soft edge; vk_framegen.cpp wide_sides. Side 3: this dispatch makes the picture at
 // 1/8 for side 1's blur instead, into dst; side 1 then reads it as small)
 layout(binding = 2) uniform sampler2D small;
-layout(push_constant) uniform P { int mode; float sharp; float x0; float x1; int side; } pc;
+layout(push_constant) uniform P { int mode; float sharp; float x0; float x1; int side; int method; } pc;   // (method: Sharpening method,
+                                                                                                // 0 the RCAS-like one, 1 AMD CAS)
 const float PI = 3.14159265;
 float lanczos2(float x) {
     x = abs(x);
@@ -67,6 +68,26 @@ vec3 sharpen(vec3 c, vec3 n, vec3 s, vec3 w, vec3 e, float amount) {
     // (and no further than the lightest and darkest pixel around it: an edge gets steeper, no halo beside it)
     return clamp(sharp, lo, hi);
 }
+// AMD FidelityFX CAS, Contrast Adaptive Sharpening: ported from ffx_cas.h, its filter without scaling.
+// Copyright (C) 2024 Advanced Micro Devices, Inc. (FidelityFX SDK 1.1.4). MIT licence: the permission notice is in
+// third_party/fidelityfx-sdk/LICENSE.txt.
+// Over the 3x3 neighbourhood one picture pixel apart: a b c / d e f / g h i, e the pixel (here the filtered one). The lobe's weight
+// comes from how far the neighbourhood is from black and white, softened by a square root, so soft areas sharpen most and edges
+// that already have contrast least: it brings back the detail a temporal upscaler (DLSS, FSR) softens. amount 0 to 1 is CAS's
+// sharpness, the peak -1/8 to -1/5. (Not AMD's: CAS's sharpness 0 is already a full -1/8 lobe, so the slider's first step, 0 to
+// 0.1, fades the lobe in from nothing, as the Gentle sharpen starts; from 0.1 on it is AMD's mapping)
+vec3 cas(vec3 a, vec3 b, vec3 c, vec3 d, vec3 e, vec3 f, vec3 g, vec3 h, vec3 i, float amount) {
+    vec3 mn = min(min(min(d, e), min(f, b)), h);
+    const vec3 mn2 = min(mn, min(min(a, c), min(g, i)));
+    mn += mn2;
+    vec3 mx = max(max(max(d, e), max(f, b)), h);
+    const vec3 mx2 = max(mx, max(max(a, c), max(g, i)));
+    mx += mx2;
+    const vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1.0 / 1024.0)), 0.0, 1.0));
+    const float peak = -1.0 / mix(8.0, 5.0, clamp(amount, 0.0, 1.0));
+    const vec3 w = amp * peak * clamp(amount * 10.0, 0.0, 1.0);
+    return clamp((b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w), 0.0, 1.0);
+}
 // beside a menu: what the game draws there (a menu's neighbouring pages, the frame of play) out of focus, a little dimmed, so the
 // middle stands out. From the picture at 1/8 (side 3's dispatch, each of its pixels the mean of an 8 x 8 block): a Gaussian of 9 x 9
 // taps 2 of its pixels apart (sigma 4 of them, about 2% of the height)
@@ -115,7 +136,13 @@ void main() {
         const vec2 e = max(1.0 / vec2(textureSize(src, 0)), 1.0 / vec2(d));
         const vec3 n = textureLod(src, uv + vec2(0.0, -e.y), 0.0).rgb, s = textureLod(src, uv + vec2(0.0, e.y), 0.0).rgb;
         const vec3 w = textureLod(src, uv + vec2(-e.x, 0.0), 0.0).rgb, r = textureLod(src, uv + vec2(e.x, 0.0), 0.0).rgb;
-        c = sharpen(c, n, s, w, r, pc.sharp);
+        if (pc.method == 1) {
+            const vec3 nw = textureLod(src, uv + vec2(-e.x, -e.y), 0.0).rgb, ne = textureLod(src, uv + vec2(e.x, -e.y), 0.0).rgb;
+            const vec3 sw = textureLod(src, uv + vec2(-e.x, e.y), 0.0).rgb, se = textureLod(src, uv + vec2(e.x, e.y), 0.0).rgb;
+            c = cas(nw, n, ne, w, c, r, sw, s, se, pc.sharp);
+        } else {
+            c = sharpen(c, n, s, w, r, pc.sharp);
+        }
     }
     if (outside > 0.0) c = mix(c, pc.side == 2 ? vec3(0.0) : side_fill(uv) + dither(g), outside);
     imageStore(dst, g, vec4(c, 1.0));

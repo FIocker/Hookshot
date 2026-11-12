@@ -121,6 +121,8 @@ const char* tx_framegen(int v) {
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 const char* tx_fps_level(int v) { return fps_stats::level_name(v); }
 const char* tx_fps_corner(int v) { return fps_stats::corner_name(v); }   // (the FPS counter row: Off, FPS, Frame time, Graph, Breakdown)
+// The Sharpness pass (opts.sharpen_method, shaders/fg_scale.comp)
+const char* tx_sharpen_method(int v) { return v == 1 ? "AMD CAS" : "Gentle"; }
 const char* tx_profile(int v) { return v ? "Handheld" : "Docked"; }   // (opts.handheld: the Profile row)
 const char* tx_menu_shortcut(int v) {
     // (F1 is never turned off: the menu is always one key away. Esc as well, as a PC game's pause menu)
@@ -817,6 +819,10 @@ Row rows[] = {
      "The share of the output the 3D is drawn at; the Upscaler fills in the rest.", hn_resolution},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
      "Sharpens the picture as it goes to the window, with any filter. Too much shows halos around edges.", hn_sharpness},
+    {TAB_GRAPHICS, "Sharpening method", &opts.sharpen_method, 0, 1, 1, tx_sharpen_method,
+     "How Sharpness sharpens. Gentle: never past the light and dark around a pixel, so no halos. AMD CAS: AMD's Contrast Adaptive "
+     "Sharpening, crisper; it brings back the detail DLSS and FSR soften, and holds back where the picture already has contrast.",
+     nullptr, false, true},
     {TAB_GRAPHICS, "Frame generation and latency", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
     {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
      "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion or camera cuts can "
