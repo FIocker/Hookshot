@@ -6236,6 +6236,27 @@ static void skin_check(const NvnState& s, const Program& p, const DrawArgs& d, c
     k.formats = pos.fmt == NVN_FORMAT_RGBA16F ? dlss_actor::kHalfPosition : 0;
     for (int set = 0; set < 2 && 6 + set < s.nvattr; set++) {
         const nvn_va_st w = attr(4 + set), j = attr(6 + set);
+        // (hookshot) a second set of one influence: an R8 weight and an R8UI or R16UI joint (Link's draws: a fifth bone,
+        // his cap's among them; left out, those vertices were skinned with part of their weight and their motion was wrong)
+        if (set == 1 && w.fmt == NVN_FORMAT_R8 && (j.fmt == NVN_FORMAT_R8UI || j.fmt == NVN_FORMAT_R16UI) && !w.stream && !j.stream) {
+            k.formats |= dlss_actor::kSingle << set;
+            if (j.fmt == NVN_FORMAT_R8UI) k.formats |= dlss_actor::kByteJoints << set;
+            k.weights[set] = w.offset, k.joints[set] = j.offset, k.sets = set + 1;
+            break;
+        }
+        // (hookshot) a rigid model on one bone: a joint and no weight (Navi's body, props, held items: a palette of one
+        // matrix, sometimes more); and two-bone skinning, RG8 weights with RG8UI joints (Navi's wings among them)
+        if (set == 0 && !w.fmt && (j.fmt == NVN_FORMAT_R8UI || j.fmt == NVN_FORMAT_R16UI) && !j.stream) {
+            k.formats |= (dlss_actor::kSingle | dlss_actor::kNoWeight) << set;
+            if (j.fmt == NVN_FORMAT_R8UI) k.formats |= dlss_actor::kByteJoints << set;
+            k.weights[set] = 0, k.joints[set] = j.offset, k.sets = set + 1;
+            break;
+        }
+        if (w.fmt == NVN_FORMAT_RG8 && j.fmt == NVN_FORMAT_RG8UI && !w.stream && !j.stream) {
+            k.formats |= (dlss_actor::kPair | dlss_actor::kByteJoints) << set;
+            k.weights[set] = w.offset, k.joints[set] = j.offset, k.sets = set + 1;
+            continue;
+        }
         if (w.fmt != NVN_FORMAT_RGBA8 || (j.fmt != NVN_FORMAT_RGBA16UI && j.fmt != NVN_FORMAT_RGBA8UI) || w.stream || j.stream ||
             w.offset % 4 || j.offset % 4)
             break;

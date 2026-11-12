@@ -620,8 +620,9 @@ uint32_t bones_used(const SkinnedDraw& k) {
     for (int64_t i = 0; i < n; i++) {
         const uint8_t* q = v.data() + (size_t)i * k.stride;
         for (int set = 0; set < k.sets; set++)
-            for (int j = 0; j < 4; j++) {
-                if (!q[k.weights[set] + j]) continue;
+            for (int j = 0; j < ((k.formats & (dlss_actor::kSingle << set)) ? 1 : (k.formats & (dlss_actor::kPair << set)) ? 2 : 4);
+                 j++) {   // (one in a single set, two in a pair; a set without weights weighs 1)
+                if (!(k.formats & (dlss_actor::kNoWeight << set)) && !q[k.weights[set] + j]) continue;
                 uint32_t joint = 0;
                 if (k.formats & (dlss_actor::kByteJoints << set)) joint = q[k.joints[set] + j];
                 else std::memcpy(&joint, q + k.joints[set] + 2 * j, 2);
